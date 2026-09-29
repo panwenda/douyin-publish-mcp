@@ -300,7 +300,7 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ## 从 GitHub Release 安装（使用者）
 
-Releases 里只有一个资产：
+[Releases](https://github.com/panwenda/douyin-publish-mcp/releases) 里只有一个资产：
 
 | 平台 | 文件 |
 | --- | --- |
