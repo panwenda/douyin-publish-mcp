@@ -417,3 +417,10 @@ python -m douyin_publish_mcp --http --port 18080
 - 每次发布都会真实落到用户账号上；"命令成功"不等于"已公开可见"（平台还有审核）。
 - 短视频平台的标题/正文/图片数量限制会变，本服务里的长度预检（标题 30 字、正文 1000 字）
   只用于**尽早报错**，不代表平台真实限额。
+
+---
+
+## 许可
+
+[Apache License 2.0](LICENSE) —— 与商店里的小红书 MCP（[`xpzouying/xiaohongshu-mcp`](https://github.com/xpzouying/xiaohongshu-mcp)）
+采用同一许可，便于两边一起用、一起改。
