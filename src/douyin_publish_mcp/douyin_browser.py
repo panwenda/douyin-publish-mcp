@@ -77,8 +77,9 @@ PYTHON_ENV = "DOUYIN_BROWSER_PYTHON"                   # 显式指定宿主解�
 #: ★ 为什么要内置：新机器上「缺驱动」不该再要求用户先读文档、配两个变量 ——
 #:   缺了就去取，这才是"exe 保持小 + 按需取驱动"这句话的兑现方式。
 #: ★ 只信哈希：Gitee 附件实测出现过"截断后仍是合法 PE 头"的同款问题，没有哈希就不装。
+#: ★ 改这里 = 换发布件，必须同步：客户端 exe_fetch.rs 的登记值、NOTICE、README 资产表。
 DRIVER_URL_DEFAULT = (
-    "https://gitee.com/pan-wenda/douyin/releases/download/v0.2.0/"
+    "https://gitee.com/pan-wenda/douyin/releases/download/v0.2.1/"
     "douyin-browser-driver-win64-patchright-1.58.2.zip"
 )
 DRIVER_SHA_DEFAULT = "8a6de597f21574094d93ee86a1e965330fae32b29aaec458385abd5ae880b03d"
@@ -243,21 +244,35 @@ def ensure_driver(cfg: BrowserConfig, sau_cfg: Optional[SauConfig] = None) -> Op
     DRIVER_DIR.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="douyin-driver-") as tmp:
         tmp_path = Path(tmp) / "driver.zip"
-        try:
-            if archive_src:
+        if archive_src:
+            try:
                 shutil.copyfile(archive_src, tmp_path)
-            else:
+            except OSError as exc:
+                raise _unavailable(
+                    "本地驱动包读不到：%s" % str(exc)[:160],
+                    "%s 指的路径不存在？离线预置请给绝对路径。" % DRIVER_ARCHIVE_ENV,
+                ) from None
+        else:
+            # ★ 下载失败与解包失败分开报：原先两者共用一句"解包失败"，
+            #   真机上看到「解包失败: getaddrinfo failed」会一头雾水（那其实是 DNS 挂了）。
+            #   报错里带上**实际用的 URL**，才能一眼看出是不是内置默认源指错了版本。
+            try:
                 _download(url, tmp_path)
-                if _sha256(tmp_path) != sha.lower():
-                    raise _unavailable(
-                        "驱动包哈希不匹配（来源 %s）" % url,
-                        "别用这个来源：字节被换过或被截断。请核对 %s 与 %s。" % (DRIVER_URL_ENV, DRIVER_SHA_ENV),
-                    )
-            DRIVER_DIR.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:  # noqa: BLE001 —— 网络原因五花八门，都要变成人话
+                raise _unavailable(
+                    "驱动包下载失败（%s）：%s" % (type(exc).__name__, str(exc)[:160]),
+                    "来源：%s\n换来源：%s；离线：先把包下好，再用 %s 指向它。"
+                    % (url, DRIVER_URL_ENV, DRIVER_ARCHIVE_ENV),
+                ) from None
+            if _sha256(tmp_path) != sha.lower():
+                raise _unavailable(
+                    "驱动包哈希不匹配（来源 %s）" % url,
+                    "别用这个来源：字节被换过或被截断。请核对 %s 与 %s。" % (DRIVER_URL_ENV, DRIVER_SHA_ENV),
+                )
+        DRIVER_DIR.mkdir(parents=True, exist_ok=True)
+        try:
             with zipfile.ZipFile(tmp_path) as zf:
                 zf.extractall(DRIVER_DIR)
-        except DouyinWebError:
-            raise
         except Exception as exc:  # noqa: BLE001 —— 装不上是环境问题，不该中断调用方
             raise _unavailable(
                 "驱动包解包失败：%s" % str(exc)[:200],

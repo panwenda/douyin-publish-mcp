@@ -420,6 +420,27 @@ class DownloadTest(unittest.TestCase):
         self.assertIn("gitee.com/pan-wenda/douyin", calls[0])
         self.assertIn("douyin-browser-driver-win64-patchright", calls[0])
 
+    def test_builtin_driver_url_points_at_current_version(self):
+        # ★ 内置来源必须指向**当前版本**的 Release 目录：换版本时忘改这里，
+        #   表现是"新机器上取驱动 404"，而且只有真机才看得见 —— 钉住它。
+        from douyin_publish_mcp import __version__
+
+        self.assertIn("/download/v%s/" % __version__, db.DRIVER_URL_DEFAULT)
+
+    def test_download_failure_says_it_is_download_not_unpack(self):
+        # 真机踩过：DNS/404 与"zip 坏了"共用一句"解包失败"，排查方向直接跑偏；
+        # 现在下载失败必须自报家门并带上实际来源 URL。
+        stripped = {k: v for k, v in os.environ.items()
+                    if k not in (db.DRIVER_URL_ENV, db.DRIVER_SHA_ENV, db.DRIVER_ARCHIVE_ENV)}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict("os.environ", stripped, clear=True):
+                with mock.patch.object(db, "DRIVER_DIR", Path(tmp) / "site-packages"):
+                    with mock.patch.object(db, "_download", mock.Mock(side_effect=OSError("getaddrinfo failed"))):
+                        with self.assertRaises(DouyinWebError) as ctx:
+                            db.ensure_driver(db.BrowserConfig(), None)
+        self.assertIn("下载失败", str(ctx.exception))
+        self.assertIn("gitee.com", str(ctx.exception.hint or ""))
+
     def test_download_off_means_no_bootstrap(self):
         # DOUYIN_BROWSER_DOWNLOAD=0：内网机器宁可报错，也不许偷偷往外发请求
         stripped = {k: v for k, v in os.environ.items()

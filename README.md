@@ -345,7 +345,7 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ```powershell
 & "$env:LOCALAPPDATA\douyin-publish-mcp\douyin-publish-mcp.exe" --http --port 18080
-# /health → {"status":"ok","service":"douyin-publish-mcp","version":"0.2.0"}
+# /health → {"status":"ok","service":"douyin-publish-mcp","version":"0.2.1"}
 # POST /mcp tools/list → 10 个工具
 ```
 
@@ -365,7 +365,7 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ## 从 Release 安装（使用者）
 
-发布源（Gitee 镜像，本公司账号）：**https://gitee.com/pan-wenda/douyin**
+发布源（Gitee 镜像，本公司账号）：**https://gitee.com/pan-wenda/douyin**（当前 v0.2.1）
 
 | 资产 | 用途 |
 | --- | --- |
