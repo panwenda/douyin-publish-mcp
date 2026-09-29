@@ -1,0 +1,21 @@
+[project]
+name = "douyin-publish-mcp"
+version = "0.2.0"
+description = "薄 MCP：抖音发布（登录/检查/发视频/发图文）+ 读取（搜索/详情/用户主页/我的主页/分享解析），共 10 个 MCP 工具"
+readme = "README.md"
+requires-python = ">=3.9"
+# ★ 刻意**零三方依赖**：只用标准库。
+#   理由：本服务跑在内网机器上（无外网），要经过 uvx 拉起 —— 依赖越少，
+#   首次启动越不容易卡在包解析上；MCP 的 stdio 协议本身只是一行一个 JSON，
+#   不需要 fastmcp 这类框架（见 src/douyin_publish_mcp/server.py）。
+dependencies = []
+
+[project.scripts]
+douyin-publish-mcp = "douyin_publish_mcp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/douyin_publish_mcp"]

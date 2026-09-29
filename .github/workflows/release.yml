@@ -1,0 +1,121 @@
+# 打 tag（v0.2.0）时出 Windows 单文件 exe，并挂到 GitHub Release
+# —— 形态对齐商店里的「小红书 MCP」：裸 exe、命名 <包名>-windows-amd64.exe，
+#    用户下回来放到 %LOCALAPPDATA%\douyin-publish-mcp\ 即可（商店配置的 command 就指那儿）。
+#
+# 为什么只出 Windows：PyInstaller **不能跨平台交叉编译**（要 macOS/Linux 产物就得有对应
+# runner），而本服务的落地场景是 Windows 客户端 + 商店 —— 先只出 windows-amd64，
+# 比"三平台都有但没人验过"诚实。
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: # 手动触发：还没打算打 tag 时也能先出一版看看
+
+permissions:
+  contents: write # 上传 Release 资产需要
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装打包工具
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: 单测（打包前先过闸；全打桩，不联网）
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          python -m unittest discover -s tests -v
+
+      - name: 打包（onefile → 单个 exe，对齐小红书的"裸二进制"资产形态）
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile `
+            --name douyin-publish-mcp `
+            --paths src `
+            --workpath build/pyinstaller --specpath build/pyinstaller --distpath dist `
+            packaging/launcher.py
+
+      - name: 启动自检（真起服务、真探活，坏了就别发）
+        shell: pwsh
+        run: |
+          $exe = "dist/douyin-publish-mcp.exe"
+          $p = Start-Process $exe -ArgumentList "--http", "--port", "18080" -PassThru
+          try {
+            $ok = $false
+            foreach ($i in 1..20) {
+              Start-Sleep -Seconds 1
+              try {
+                $h = Invoke-RestMethod "http://127.0.0.1:18080/health" -TimeoutSec 3
+                if ($h.status -eq "ok") { $ok = $true; break }
+              } catch { }
+            }
+            if (-not $ok) { throw "自检失败：/health 没起来" }
+            Write-Host "health ok: $($h | ConvertTo-Json -Compress)"
+
+            $init = Invoke-RestMethod "http://127.0.0.1:18080/mcp" -Method Post `
+              -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' `
+              -ContentType "application/json" -TimeoutSec 5
+            Write-Host "serverInfo: $($init.result.serverInfo | ConvertTo-Json -Compress)"
+
+            $tl = Invoke-RestMethod "http://127.0.0.1:18080/mcp" -Method Post `
+              -Body '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' `
+              -ContentType "application/json" -TimeoutSec 5
+            Write-Host "tools: $($tl.result.tools.Count)"
+            if ($tl.result.tools.Count -lt 10) { throw "自检失败：工具数不对" }
+          } finally {
+            if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+
+      - name: 改名成 Release 资产名（对齐 xiaohongshu-mcp 的命名）
+        shell: pwsh
+        run: Move-Item dist/douyin-publish-mcp.exe dist/douyin-publish-mcp-windows-amd64.exe
+
+      - name: 挂到 Release（★ 只有打 tag 时才发；workflow_dispatch 只构建、不发布）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/douyin-publish-mcp-windows-amd64.exe
+          generate_release_notes: true
+          body: |
+            ## 下载
+
+            | 平台 | 文件 |
+            | --- | --- |
+            | Windows x64 | `douyin-publish-mcp-windows-amd64.exe` |
+
+            ## 用法
+
+            ```powershell
+            # 1. 放到约定目录（商店配置里的 command 就指这里）
+            $dst = "$env:LOCALAPPDATA\douyin-publish-mcp"
+            New-Item -ItemType Directory -Force $dst | Out-Null
+            Move-Item .\douyin-publish-mcp-windows-amd64.exe "$dst\douyin-publish-mcp.exe" -Force
+
+            # 2. 启动（本机常驻，只绑 127.0.0.1）
+            & "$dst\douyin-publish-mcp.exe" --http --port 18080
+
+            # 3. 探活 / 状态页
+            Invoke-RestMethod http://127.0.0.1:18080/health
+            start http://127.0.0.1:18080/
+            ```
+
+            ## 前置
+
+            本服务**只管抖音的协议与门禁**，真正的发布/登录动作由
+            [social-auto-upload](https://github.com/dreammis/social-auto-upload) 的 `sau` CLI 完成：
+
+            1. 装 `sau`（`git clone` + `uv sync` + `uv pip install -e .` + `patchright install chromium`）；
+            2. 在服务配置里填 `SAU_CMD`（sau.exe 绝对路径）或 `SAU_DIR`（项目根目录）与 `SAU_MEDIA_DIR`；
+            3. 先扫码登录一次（状态页上有入口），发布与读取共用这份登录态。
+
+            > ★ 与小红书 MCP 的差别：那边 exe 自带浏览器、装完即用；这边需要本机有 `sau`。
+            > 读取走 HTTP 直连，不额外下浏览器。

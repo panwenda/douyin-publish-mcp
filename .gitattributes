@@ -1,0 +1,13 @@
+# 仓库内一律 LF，检出时按平台转换（避免 Windows 上提交 CRLF 造成整文件 diff）
+* text=auto
+
+# Windows 脚本：保持 CRLF，且**必须保留 UTF-8 BOM**
+#   —— PowerShell 5.1 会把没有 BOM 的 .ps1 按 ANSI(GBK) 读，中文注释变乱码后直接语法错
+*.ps1 text eol=crlf
+
+# 二进制（别做行尾转换，不然 exe/图片会被改坏）
+*.exe binary
+*.dll binary
+*.zip binary
+*.png binary
+*.ico binary

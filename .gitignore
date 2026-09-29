@@ -1,0 +1,11 @@
+# Python 构建/缓存产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# 本地运行留痕（不要提交：素材与项目目录路径属于各人环境）
+.env
+.env.local
