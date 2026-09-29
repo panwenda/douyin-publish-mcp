@@ -106,6 +106,28 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 `SAU_MEDIA_DIR` 没配时**所有发布工具都会拒绝执行**并说明怎么配 ——
 这是刻意的：宁可报"没配置"，也不能退化成"整个磁盘可读"。
 
+### 只读取、不装 social-auto-upload 行吗？
+
+**行，但得自己给一份 cookie。** 实测（Windows，v0.2.1，环境里 `SAU_*` 一个都不配）：
+
+| 能力 | 不装 sau | 说明 |
+| --- | --- | --- |
+| 服务启动 / `/health` / HTTP 端点 | ✅ | 起得来，启动日志里写着 `SAU_CMD=(未设置)` |
+| 读取 5 个工具 | ✅ **需要 cookie** | 设 `DOUYIN_COOKIE_FILE`（或 `DOUYIN_COOKIE`）；实测 8.5 秒拿到作品详情与无水印直链、1.3 秒搜到 3 条 |
+| 浏览器通道（详情 / 用户作品 / 评论） | ✅ | 驱动按需自取、浏览器用系统 Chrome，都不依赖 sau |
+| 发布 5 个工具 | ❌ | 真实动作由 `sau` CLI 完成 |
+| 扫码登录 / 账号检查 | ❌ | 同样走 `sau`（`sau douyin check`，扫码用它的 `douyin_cookie_gen`） |
+
+两点代价，先想清楚再走这条路：
+
+1. **cookie 会过期** —— 过期后读取报 `no_credential` / `blocked`，得重新导出一份。
+   长期用还是装 sau 更省事（它能扫码续期），这条路适合"导一次、只读一阵子"。
+2. 凭据**两种格式都认**：浏览器 DevTools 里复制的整串 Cookie，或 patchright / Playwright
+   的 `storage_state` JSON。给了文件就优先用它 —— 环境里的残留文件不会盖掉你明确指定的那个。
+
+> 商店条目里 `envVars` 故意留空也是同一个原因：`SAU_*` 与 cookie 路径都是**机器相关**的，
+> 猜一个写死进去，错了就是"装完直接报找不到文件"，比留空更难排查。
+
 ---
 
 ## 十个工具（5 个发布/账号 + 5 个读取）
