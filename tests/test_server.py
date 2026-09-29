@@ -131,9 +131,10 @@ class TestProtocol(ServerCase):
             desc = next(t["description"] for t in tools if t["name"] == name)
             self.assertIn("不会发布任何东西", desc)
             self.assertIn("confirm=true", desc)
-        # 登录工具要如实说明"二维码在用户屏幕上"（抖音这条链路拿不到二维码图）
+        # 登录工具要如实说明"弹真窗口、扫码成功后自动关闭"（无头扛不住抖音的反自动化与短信验证）
         login_desc = next(t["description"] for t in tools if t["name"] == "douyin_account_login")
-        self.assertIn("用户自己的屏幕上", login_desc)
+        self.assertIn("真浏览器窗口", login_desc)
+        self.assertIn("自动关闭", login_desc)
         # 重置登录态也要两步
         logout_desc = next(t["description"] for t in tools if t["name"] == "douyin_account_logout")
         self.assertIn("confirm", logout_desc)

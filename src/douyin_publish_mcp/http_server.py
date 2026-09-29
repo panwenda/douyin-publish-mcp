@@ -119,7 +119,7 @@ class App:
             self.set_notice(str(e))
             return
         self.set_notice(
-            f"已发起账号「{account}」的登录，请在屏幕上弹出的浏览器窗口扫码。"
+            f"已发起账号「{account}」的登录。二维码在页面上，请直接扫（不弹浏览器窗口）。"
             f"（当前状态：{'等待扫码' if snap.get('running') else '已结束'}）",
             is_error=False,
         )
@@ -209,8 +209,9 @@ class App:
             )
         elif snap.get("running"):
             qr_block = (
-                '<p class="hint">这个平台/版本没把二维码落盘 —— 二维码在用户屏幕上弹出的浏览器窗口里，'
-                "让他直接看那个窗口扫码即可。</p>"
+                '<p class="hint">这个平台/版本没把二维码落盘 —— 默认的无头模式拿不到图。'
+                "改传 headed=true 重新发起，窗口会弹在用户屏幕上；"
+                "或让用户在本机终端手动执行登录命令（那里会落盘二维码）。</p>"
             )
 
         notice_block = (
@@ -446,6 +447,8 @@ def make_handler(app: App) -> Callable[..., BaseHTTPRequestHandler]:
                 form = parse_qs(raw.decode("utf-8", errors="replace"))
                 account = (form.get("account") or [""])[0]
                 if path == "/login":
+                    # ★ 与工具一致：状态页登录也弹真窗口（抖音会挑无头浏览器 + 可能要输短信验证码），
+                    #   二维码同时由页面上的 <img> 显示；扫码成功后 sau 会自己关掉窗口
                     app.start_login(account, headed=True)
                 elif path == "/check":
                     app.start_check(account)

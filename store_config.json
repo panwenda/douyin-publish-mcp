@@ -1,7 +1,7 @@
 {
   "serviceName": "douyin-publish",
   "displayName": "抖音发布与读取（social-auto-upload）",
-  "description": "本机常驻服务：发布短视频/图文到抖音（可定时），并读取抖音数据（搜视频、作品详情与无水印直链、用户主页、我的主页、分享链接解析）。共 10 个工具。登录一次即可：发布与读取共用同一份登录态（扫码在浏览器窗口里，也可在状态页 http://127.0.0.1:18080/ 发起）。需自备 social-auto-upload（sau）并配 SAU_CMD 或 SAU_DIR。发布分两步：先返回待发布计划，用户确认后才执行。",
+  "description": "本机常驻服务：发布短视频/图文到抖音（可定时），并读取抖音数据（搜视频、作品详情与无水印直链、用户主页、我的主页、分享链接解析）。共 10 个工具。登录一次即可：发布与读取共用同一份登录态（扫码会弹一个真窗口，扫完自动关闭；也可在状态页 http://127.0.0.1:18080/ 发起）。需自备 social-auto-upload（sau）并配 SAU_CMD 或 SAU_DIR。发布分两步：先返回待发布计划，用户确认后才执行。",
   "transportType": "streamable_http",
   "command": "%LOCALAPPDATA%\\douyin-publish-mcp\\douyin-publish-mcp.exe",
   "args": "--http --port 18080",

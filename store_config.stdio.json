@@ -2,7 +2,7 @@
   "_说明": "备选形态：stdio（宿主当子进程拉起，无需打包 exe、无需端口）。优点是不用装 exe、没有端口占用；缺点是没有登录页、宿主重启会杀子进程。两个形态用的是同一份工具实现，按需选一个发布即可 —— 同时发布两条会让同一批工具在注册表里重名。",
   "serviceName": "douyin-publish",
   "displayName": "抖音发布与读取（social-auto-upload·stdio）",
-  "description": "stdio 形态：发布短视频/图文到抖音（可定时），并读取抖音数据（搜视频、作品详情与无水印直链、用户主页、我的主页、分享链接解析）。共 10 个工具，登录一次即可：发布与读取共用同一份登录态。需自备 social-auto-upload（sau）并配 SAU_CMD 或 SAU_DIR。发布分两步：先返回待发布计划，用户确认后才执行。二维码以图片返回（卡片里直接显示）。",
+  "description": "stdio 形态：发布短视频/图文到抖音（可定时），并读取抖音数据（搜视频、作品详情与无水印直链、用户主页、我的主页、分享链接解析）。共 10 个工具，登录一次即可：发布与读取共用同一份登录态。需自备 social-auto-upload（sau）并配 SAU_CMD 或 SAU_DIR。发布分两步：先返回待发布计划，用户确认后才执行。扫码会弹一个浏览器窗口，扫完自动关闭（二维码同时以图片返回，卡片里直接显示）。",
   "transportType": "stdio",
   "command": "uvx",
   "args": "--from http://<内网GitLab>/<group>/douyin-publish-mcp/-/archive/main/douyin-publish-mcp-main.zip douyin-publish-mcp",

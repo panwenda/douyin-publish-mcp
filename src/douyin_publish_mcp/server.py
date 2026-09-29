@@ -96,8 +96,11 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "douyin_account_login",
         "description": (
             "让用户扫码登录抖音。"
-            "★ 有头模式下浏览器窗口弹在**用户自己的屏幕上**，二维码在那个窗口里 —— "
-            "请让用户去看屏幕扫码，本工具不会（也无法）把二维码图交给你，别承诺「我把二维码给你看」。"
+            "★ 会弹出一个**真浏览器窗口**：登录这一步必须用真窗口 —— 抖音的反自动化会挑无头浏览器，"
+            "而且可能要求短信二次验证，那只能在窗口里手动输。"
+            "二维码同时也会作为**图片**返回（和窗口里是同一个码），展示给用户扫也行。"
+            "**扫码成功后窗口会自动关闭**（sau 存完 cookie 就关掉浏览器并退出，约 2 秒后消失）；"
+            "若一直没人扫，窗口最多活 2 分钟也会自己关，不会一直挂在用户屏幕上。"
             "调用会等一段（wait_seconds）：扫得快就一次拿到结论；"
             "还在等就返回「会话仍在等待扫码」，此时**再调一次本工具**即可继续查，不要重复发起新登录。"
             "若发布时触发短信二次验证，把验证码写进项目根目录的 verify_code.txt 再重试发布。"
@@ -108,7 +111,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "account": {"type": "string", "description": "账号名（自定义，用于区分多个抖音号）"},
                 "headed": {
                     "type": "boolean",
-                    "description": "是否显示浏览器窗口（默认 true；扫码必须能看见窗口）。无桌面环境时才传 false。",
+                    "description": "是否弹出浏览器窗口。默认 true：登录必须用真窗口（抖音的反自动化会挑无头浏览器，且可能要输短信验证码）；扫码成功后窗口自动关闭。只在没有桌面会话（CI/服务器）时才传 false。",
                 },
                 "wait_seconds": {
                     "type": "number",
@@ -373,7 +376,7 @@ def tool_account_status(
         # 「没查」不等于「没登录」：如实说跳过，并告诉模型下一步
         return _text(
             f"这次**没有检查**：{rec.output}\n"
-            f"请让用户先在浏览器窗口里扫完码（或调用 douyin_account_login 继续等），"
+            f"请让用户先用 douyin_account_login 扫码（二维码以图片返回，不弹浏览器窗口），"
             f"扫完会自动检查一次；也可以稍后再调本工具。",
             is_error=False,
         )
@@ -414,6 +417,10 @@ def tool_account_login(
       会话留在进程里（见 login_session.py），用户可以再调一次接着查。
     """
     account = _require_str(args, "account")
+    # ★ 默认**有头**（真窗口）：登录这一步抖音的反自动化会挑无头浏览器，
+    #   而且可能要求短信二次验证 —— 那只能在窗口里手动输，无头做不到。
+    #   窗口不会久留：sau 扫码成功后存完 cookie 就关掉浏览器并退出进程
+    #   （见 douyin_cookie_gen 的 finally 里 browser.close()），没人扫也最多等 2 分钟。
     headed = bool(args.get("headed", True))
     wait_seconds = _bounded_float(args.get("wait_seconds"), default=90.0, lo=0.0, hi=600.0)
     sessions = sessions or LoginSessionManager(cfg)
@@ -427,7 +434,13 @@ def tool_account_login(
     if snap.get("running"):
         lines.append(
             f"账号「{account}」的登录已发起，**正在等扫码**（已等 {snap.get('elapsedSec')}s）。\n"
-            f"请让用户到屏幕上的浏览器窗口扫码（二维码只在那里，本工具拿不到图）。\n"
+            "浏览器窗口已经弹在用户的屏幕上了，让用户直接在窗口里扫码。\n"
+            + (
+                "（同一个二维码也附在下面这张图里；不方便看窗口时扫这张也行。）\n"
+                if snap.get("qrPath")
+                else ""
+            )
+            + "**扫完窗口会自动关闭**，不用手动关。"
             f"扫完后**再调一次本工具**（或 douyin_account_status）确认结果 —— "
             f"重复调用不会另开一个登录会话，只是继续查这一个。"
         )
@@ -449,7 +462,7 @@ def tool_account_login(
         lines.append(
             f"登录流程失败（退出码 {snap.get('exitCode')}）。{snap.get('error') or ''}\n"
             f"常见原因：浏览器运行时没装好（patchright install chromium）、"
-            f"或本机没有桌面会话（此时 headed=false 无意义，扫码必须在用户自己的机器上做）。"
+            f"或账号名与项目里登录时用的不一致。"
         )
         lines.append(f"也可让用户在本机终端手动执行：{_manual_login_cmd(cfg, account)}")
 
@@ -939,6 +952,9 @@ def _bounded_float(value: Any, default: float, lo: float, hi: float) -> float:
 
 def _manual_login_cmd(cfg: SauConfig, account: str) -> str:
     """给用户手敲的登录命令（模型可以把这行原样转述出去）"""
+    # ★ 这里是**人工排查**路径（把命令原样交给用户，让他在自己终端里跑）：
+    #   故意保留 --headed —— 那时用户就在终端前，直接看到窗口里的二维码，
+    #   比让他去目录里翻二维码图片直观。工具走的默认路径是无头。
     return " ".join(cfg.command(sau.login_args(account, headed=True)))
 
 

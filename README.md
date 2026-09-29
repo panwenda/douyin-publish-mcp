@@ -25,7 +25,7 @@
 | 启动方式 | 宿主当子进程拉起（`kill_on_drop`） | 商店配置给 `command`，客户端 detached 常驻 |
 | 端点 | stdin/stdout，一行一个 JSON-RPC | `POST http://127.0.0.1:18080/mcp` |
 | 需要打包 exe | 不需要（`uvx --from <包>` 即可） | **需要**（`command` 要是可执行文件绝对路径） |
-| 扫码登录 | 会话式工具：二维码在用户屏幕的浏览器窗口里 | 同上，**外加本机状态页** `http://127.0.0.1:18080/`（发起/取消扫码、重置登录态） |
+| 扫码登录 | 会话式工具：弹**真窗口**扫码，**成功后窗口自动关闭** | 同上，**外加本机状态页** `http://127.0.0.1:18080/`（发起/取消扫码、重置登录态） |
 | 宿主重启 | 子进程跟着死 | 服务不重启（登录态、运行记录都在） |
 | 停用 | 宿主 kill 子进程 | 客户端按**进程台账 / 端口归属**收进程（`local_service.rs`） |
 | 鉴权 | 无需（父子进程） | 可选 `AUTH_TOKEN` → 客户端配 `Authorization: Bearer <token>` |
@@ -73,7 +73,7 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 | `SAU_DIR` | 二选一 | social-auto-upload 项目根目录 → 用 `uv run --directory <dir> sau` 调起 |
 | `SAU_MEDIA_DIR` | 发布必填 | **允许发布的素材根目录**（默认取 `SAU_DIR`）。给的素材路径必须落在它里面 |
 | `SAU_TIMEOUT` | 否 | 单次调用超时秒数，默认 900（上传慢，别调太小） |
-| `SAU_HEADLESS` | 否 | `1`（默认）无头 / `0` 有头。登录会强制有头，不受它影响 |
+| `SAU_HEADLESS` | 否 | `1`（默认）无头 / `0` 有头 —— **只管发布**；登录由工具的 `headed` 参数控制，**默认 true 弹真窗口** |
 | `SAU_UV` | 否 | uv 可执行文件路径（默认 `uv`） |
 | `SAU_NO_SYNC` | 否 | `1` = `uv run --no-sync`（更快，但要求事先 `uv sync` 过） |
 | `SAU_VERIFY_CODE_FILE` | 否 | 短信验证码文件，默认 `<SAU_DIR>/verify_code.txt` |
@@ -92,7 +92,7 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 | 工具 | 作用 | 模型该怎么用 |
 | --- | --- | --- |
 | `douyin_account_status(account)` | 查登录态 | 判据是 `sau douyin check` 的**退出码**（0=valid / 1=invalid），文本兜底；未登录会提示去登录 |
-| `douyin_account_login(account, headed=true, wait_seconds=90)` | 扫码登录（**会话式**） | 浏览器窗口弹在用户屏幕上，二维码在那儿；调用等一段就返回状态，还在等就**再调一次**继续查（不会另开会话）；扫完自动检查一次 |
+| `douyin_account_login(account, headed=true, wait_seconds=90)` | 扫码登录（**会话式**） | 弹**真窗口**（抖音会挑无头浏览器，且可能要输短信验证码），二维码同时以图片返回；**扫完窗口自动关闭**（没人扫也最多 2 分钟）；调用等一段就返回状态，还在等就**再调一次**继续查（不会另开会话）；扫完自动检查一次 |
 | `douyin_account_logout(account, confirm=false)` | 重置登录态 | ★ 两步：先回报"将要删除的凭据文件"，用户同意后才 `confirm=true` |
 | `douyin_publish_video(account, file, title, description?, tags?, schedule?, thumbnail_portrait?, thumbnail_landscape?, product_link?, product_title?, declaration?, collection?, plan_id?, confirm?)` | 发布视频 | 先不传 confirm 拿计划 → 念给用户 → 带 `plan_id`+`confirm=true` 再调 |
 | `douyin_publish_note(account, images[], title, note?, note_file?, bgm?, tags?, schedule?, confirm?)` | 发布图文（≤35 张，不支持 GIF） | 同上；长正文用 `note_file`（指向素材目录内的 .txt/.md） |

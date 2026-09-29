@@ -81,6 +81,10 @@ class LoginSession:
         self,
         cfg: SauConfig,
         account: str,
+        # ★ 默认有头（真窗口）：登录这一步抖音的反自动化会挑无头浏览器，且可能要输短信验证码。
+        #   窗口不会久留 —— sau 扫码成功后存完 cookie 就 browser.close() 并退出进程，
+        #   一直没人扫也最多等 2 分钟（见 douyin_cookie_gen 的 finally）。
+        #   headed=false 留给没有桌面会话的场景（CI / 服务器）。
         headed: bool = True,
         on_finish: Optional[Callable[["LoginSession"], None]] = None,
     ):
