@@ -1,4 +1,4 @@
-"""命令行入口：一个包，两种形态。
+"""命令行入口：一个包，三种形态。
 
 ```bash
 # stdio（默认；宿主当子进程拉起，registry 里 transportType=stdio）
@@ -7,6 +7,15 @@ douyin-publish-mcp
 # streamable_http（本机常驻；registry 里 transportType=streamable_http）
 douyin-publish-mcp --http --port 18080 --token <secret>
 ```
+
+另外有两个**隐藏入口**（不写进 --help，它们是本程序自己拉起的内部约定，
+别去命令行敲）：
+
+- `--browser-helper <spec>`：浏览器通道的宿主 —— 读页面、听页面自己发的请求；
+- `--creator-helper <spec>`：创作者中心自动化 —— 扫码登录、发布视频/图文。
+
+两个都跑在本程序自己里（冻结后就是同一个 exe），好处是 exe 里**不放**浏览器驱动
+（patchright 那 ~100MB），驱动按需取、只挂在子进程的 PYTHONPATH 上。
 
 ★ 默认必须是 stdio：已有的商店配置就是按 stdio 发布的，改成"必须带 --http"
   会让那批配置在升级后静默起不来（MCP 子进程既不握手也不报错，只表现为"工具没了"）。
@@ -19,7 +28,7 @@ import sys
 
 from . import __version__
 from .http_server import serve_http
-from .sau import SauConfig
+from .config import RuntimeConfig
 from .server import SERVER_NAME, Server
 
 
@@ -27,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="douyin-publish-mcp",
         description=(
-            "抖音发布与读取（social-auto-upload）：发布视频/图文，"
+            "抖音发布与读取：发布视频/图文、扫码登录与登录态检查，"
             "并搜索视频、看作品详情与无水印直链、看用户主页/我的主页（stdio 或 streamable_http）"
         ),
     )
@@ -40,10 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTTP 鉴权 token（留空则读 AUTH_TOKEN 环境变量；绑定非本机地址时必填）",
     )
     p.add_argument("--version", action="version", version="%s %s" % (SERVER_NAME, __version__))
-    # ★ 隐藏入口：浏览器通道的宿主就是本程序自己（`douyin-publish-mcp.exe --browser-helper <spec>`）。
-    #   这样 exe 里不用放浏览器驱动（patchright 那 ~90MB），驱动按需取、挂在子进程的 PYTHONPATH 上。
-    #   刻意不写进 --help：它不是给用户敲的，是 douyin_browser.py 拉起的内部约定。
     p.add_argument("--browser-helper", metavar="SPEC", default="", help=argparse.SUPPRESS)
+    p.add_argument("--creator-helper", metavar="SPEC", default="", help=argparse.SUPPRESS)
     return p
 
 
@@ -53,7 +60,11 @@ def main(argv=None) -> int:
         from .browser_helper import main as helper_main
 
         return helper_main([args.browser_helper])
-    cfg = SauConfig.from_env()
+    if args.creator_helper:
+        from .creator_helper import main as creator_main
+
+        return creator_main([args.creator_helper])
+    cfg = RuntimeConfig.from_env()
     if args.http:
         import os
 
@@ -62,8 +73,8 @@ def main(argv=None) -> int:
         return 0
     # stdio：与既有商店配置完全一致的行为
     sys.stderr.write(
-        "[%s] stdio 就绪：SAU_CMD=%s SAU_DIR=%s 素材目录=%s\n"
-        % (SERVER_NAME, cfg.cmd or "(未设置)", cfg.project_dir or "(未设置)", cfg.media_dir or "(未设置)")
+        "[%s] stdio 就绪：素材目录=%s 账号=%s 超时=%ss\n"
+        % (SERVER_NAME, cfg.media_dir or "(未设置，发布会被拒绝)", cfg.account, cfg.timeout)
     )
     sys.stderr.flush()
     Server(cfg).serve()

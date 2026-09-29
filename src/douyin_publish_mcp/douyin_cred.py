@@ -1,12 +1,16 @@
-"""抖音**读取通道**的凭据：把登录态从 social-auto-upload 的凭据文件里取出来。
+﻿"""抖音的**凭据**：找到登录态、解析成请求能用的 cookie。
 
-## 为什么复用 sau 的凭据文件，而不是再登录一次
+## 登录态只有一个来源
 
-本服务的登录态只有一个来源：`sau douyin login` 写出的
-`<项目>/cookies/douyin_<账号>.json`（patchright 的 storage_state，标准
-Playwright 格式）。读取工具若自带一套登录，会出现两个坏结果：
-①「发布说已登录、读取说没登录」这种自相矛盾的状态，
-② 多一份会过期、要单独清理的凭据。
+v0.3.0 起本服务**自己管**登录态：`douyin_account_login` 写
+`<数据目录>/douyin_<账号>.json`（patchright 的 storage_state，标准 Playwright 格式），
+读取、发布、退出登录读的都是这一份。一台机器上多个账号就是多个文件。
+
+优先级（显式配置永远压过推导出来的路径）：
+
+1. `DOUYIN_COOKIE_FILE`：自己指定一份（比如从浏览器导出的）；
+2. `DOUYIN_COOKIE`：直接给整串 cookie（容器/临时调试）；
+3. 我们自己的数据目录（默认，见 `config.credential_path`）。
 
 ## 只回显 cookie 名，不回显值
 
@@ -16,7 +20,7 @@ cookie 是凭据。工具输出与状态页里只允许出现 cookie 的**名字
 
 ## 安全边界
 
-本模块**只读**凭据文件：不写、不改、不删（唯一的删除动作在 `sau.logout`，
+本模块**只读**凭据文件：不写、不改、不删（唯一的删除动作在 `account.logout`，
 且那件事只允许删一个文件）。
 """
 
@@ -30,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from .sau import SauConfig, SauError, account_file_path
+from .config import ConfigError, RuntimeConfig, credential_path
 
 # ── cookie 名 ────────────────────────────────────────────────
 # 有其中任意一个才算「已登录」：这些是抖音的会话凭据，匿名访问不会带。
@@ -210,10 +214,27 @@ def credential_from_raw(raw: str, source: str, account: str = "", path: Optional
 
 def default_account() -> str:
     """默认账号名：只读显式配置，**不猜**（与状态页的默认值同一口径）。"""
-    return (os.environ.get("SAU_ACCOUNT") or os.environ.get("DOUYIN_ACCOUNT") or "main").strip()
+    from .config import default_account as _from_config
+
+    return _from_config()
 
 
-def resolve_credential(cfg: SauConfig, account: str = "") -> Credential:
+def redact(text: str) -> str:
+    """抹掉输出里可能出现的凭据 —— 日志/回传文本都要先过它。
+
+    ★ 正常路径下我们从不打印 cookie，这是**附带的防御**：万一某天有人在调试输出里
+      顺手 `print(cookie)`，这里兜住它（验证码、token 同理）。
+    """
+    out = text or ""
+    return re.sub(
+        r"(sessionid|passport_csrf_token|ttwid|session_key|sid_tt|api_?key|token)\s*[=:]\s*[^\s;\"']+",
+        r"\1=***",
+        out,
+        flags=re.IGNORECASE,
+    )
+
+
+def resolve_credential(cfg: RuntimeConfig, account: str = "") -> Credential:
     """按优先级找一个可用的凭据：
 
     1. `DOUYIN_COOKIE_FILE`：显式指定的文件（storage_state 或裸 Cookie 串）——
@@ -232,45 +253,36 @@ def resolve_credential(cfg: SauConfig, account: str = "") -> Credential:
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
-            raise SauError(
+            raise ConfigError(
                 f"读不到 DOUYIN_COOKIE_FILE 指向的文件：{path}（{e.strerror or e}）。"
                 f"请核对路径，或去掉这个环境变量改用 sau 的凭据文件。"
             ) from None
         cred = credential_from_raw(raw, f"DOUYIN_COOKIE_FILE（{path}）", account, path)
         if not cred.usable:
-            raise SauError(f"{path} 里没有可用的抖音 cookie（既没有 ttwid，也没有登录标识）。")
+            raise ConfigError(f"{path} 里没有可用的抖音 cookie（既没有 ttwid，也没有登录标识）。")
         return cred
 
     inline = (os.environ.get("DOUYIN_COOKIE") or "").strip()
     if inline:
         cred = credential_from_raw(inline, "DOUYIN_COOKIE（环境变量）", account)
         if not cred.usable:
-            raise SauError("DOUYIN_COOKIE 里没有可用的抖音 cookie（既没有 ttwid，也没有登录标识）。")
+            raise ConfigError("DOUYIN_COOKIE 里没有可用的抖音 cookie（既没有 ttwid，也没有登录标识）。")
         return cred
 
-    try:
-        path = account_file_path(cfg, account)
-    except SauError as e:
-        # ★ 只用 SAU_CMD、没配 SAU_DIR 的用户会走到这里（发布能用、读取定位不到凭据）。
-        #   不要把它变成一次崩溃，也不要说成"没登录"—— 如实说清"缺什么"，
-        #   并给出两条可选的补救路径（显式文件 / 显式 cookie）。
-        return Credential(
-            source=(
-                f"{e}\n"
-                f"（替代做法：设 DOUYIN_COOKIE_FILE 指向凭据文件，或设 DOUYIN_COOKIE 直接给整串 cookie）"
-            ),
-            account=account,
-        )
+    # 默认位置：本服务自己的数据目录（见 config.credential_path）。
+    # ★ 这条路径永远成立，不需要用户先配项目目录 —— v0.3.0 起登录态由我们自己管：
+    #   登录工具写它、读取/发布读它、退出登录删它。
+    path = credential_path(account)
     if not path.is_file():
         # 不抛异常：调用方要把"没登录"讲成"去扫码"，而不是崩一次
-        return Credential(source=f"sau 凭据文件不存在（{path}）", account=account, path=path)
+        return Credential(source=f"本服务数据目录里的凭据文件不存在（{path}）", account=account, path=path)
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return Credential(
             source=f"读不到 sau 凭据文件（{path}：{e.strerror or e}）", account=account, path=path
         )
-    cred = credential_from_raw(raw, f"sau 凭据文件（{path}）", account, path)
+    cred = credential_from_raw(raw, f"本服务数据目录的凭据文件（{path}）", account, path)
     if not cred.cookie:
         cred.source = f"sau 凭据文件里没有 cookie（{path}）"
     return cred
@@ -296,6 +308,7 @@ __all__ = [
     "LOGIN_COOKIE_KEYS",
     "DEVICE_COOKIE_KEYS",
     "REQUEST_COOKIE_KEYS",
+    "redact",
     "parse_storage_state",
     "parse_cookie_header",
     "cookie_header_from_cookies",

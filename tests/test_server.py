@@ -1,4 +1,4 @@
-"""MCP 协议层与发布门禁的单测（不真跑 sau：`sau.run` 全部被打桩）。
+﻿"""MCP 协议层与发布门禁的单测（不真起浏览器：自动化那一步全部被打桩）。
 
 ★ 这里钉的是最要紧的一条契约：**没有确认（plan_id + confirm=true）就不许执行发布**。
   它一旦回退，模型一次误判就直接落到用户账号上，而发布是不可撤销的。
@@ -13,12 +13,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from douyin_publish_mcp import douyin_web, sau
+from douyin_publish_mcp import config as config_mod
+from douyin_publish_mcp import douyin_browser as browser
+from douyin_publish_mcp import douyin_web
+from douyin_publish_mcp import login_session
+from douyin_publish_mcp import account as account_mod
+from douyin_publish_mcp.account import AccountCheck
 from douyin_publish_mcp.server import Server, plan_fingerprint
 
 
 class FakeProc:
-    """假的 `sau douyin login` 进程：`exit_after=None` 表示"永不等不到扫码结果"。
+    """假的自动化进程：`exit_after=None` 表示"永远等不到扫码结果"。
 
     ★ 为什么造它：登录会话必须是**异步**的（等扫码要几分钟），
       用一个真进程测会让用例要么很慢、要么不确定。这里只要行为对得上就够了：
@@ -40,7 +45,10 @@ class FakeProc:
                 time.sleep(0.2)
                 return None
             time.sleep(min(timeout, 0.05))
-            raise subprocess.TimeoutExpired("fake-sau", timeout)
+            raise subprocess.TimeoutExpired("fake-helper", timeout)
+        return self._exit
+
+    def poll(self):
         return self._exit
 
     def terminate(self):
@@ -50,6 +58,20 @@ class FakeProc:
     def kill(self):
         self.killed = True
         self._exit = 1
+
+
+def helper_run(proc, root) -> browser.HelperRun:
+    """把假进程包成真的 HelperRun（登录会话会用它 terminate/cleanup）"""
+    return browser.HelperRun(proc=proc, spec_path=Path(root) / "spec.json", host=browser.Host(["x"]))
+
+
+#: 自动化那一步的"成功"回执（形状与 `--creator-helper` 的约定一致）
+def published(message="上传完成"):
+    return {"ok": True, "state": "published", "message": message, "steps": [], "warnings": []}
+
+
+def login_ok_payload() -> bytes:
+    return b'{"ok": true, "action": "login", "state": "success"}\n'
 
 TOOL_NAMES = {
     "douyin_account_status",
@@ -75,10 +97,28 @@ class ServerCase(unittest.TestCase):
         (self.root / "imgs").mkdir()
         for i in (1, 2):
             (self.root / "imgs" / f"{i}.png").write_bytes(b"p" * 32)
-        self.cfg = sau.SauConfig(cmd="sau", media_dir=str(self.root), timeout=60)
+        # ★ 凭据默认落在 DOUYIN_DATA_DIR（v0.3.0 起本服务自己管登录态，不再看别人的项目目录）
+        self.data = self.root / "data"
+        self.data.mkdir()
+        (self.data / "douyin_main.json").write_text(
+            json.dumps({"cookies": [
+                {"name": "sessionid", "value": "SECRET", "domain": ".douyin.com"},
+                {"name": "ttwid", "value": "t", "domain": ".douyin.com"},
+            ]}),
+            encoding="utf-8",
+        )
+        import os
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("DOUYIN_COOKIE", "DOUYIN_COOKIE_FILE")}
+        env["DOUYIN_DATA_DIR"] = str(self.data)
+        self._env = mock.patch.dict(os.environ, env, clear=True)
+        self._env.start()
+        self.cfg = config_mod.RuntimeConfig(media_dir=str(self.root), timeout=60)
         self.server = Server(self.cfg)
 
     def tearDown(self):
+        self._env.stop()
         self._tmp.cleanup()
 
     # ── 辅助 ────────────────────────────────────────────────
@@ -177,7 +217,7 @@ class TestPublishGate(ServerCase):
     """★ 发布门禁：预检不执行、确认对不上不执行、对上才执行一次"""
 
     def test_预检只交计划_绝不执行发布(self):
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(browser, "run_helper") as run:
             result = self.call(
                 "douyin_publish_video",
                 {"account": "main", "file": "videos/a.mp4", "title": "周末随拍"},
@@ -196,8 +236,8 @@ class TestPublishGate(ServerCase):
             {"account": "main", "file": "videos/a.mp4", "title": "周末随拍"},
         )
         plan_id = self.plan_id_of(prep)
-        fake = sau.SauResult(argv=["sau"], exit_code=0, stdout="上传完成", stderr="")
-        with mock.patch.object(sau, "run", return_value=fake) as run:
+        fake = {"ok": True, "state": "published", "message": "上传完成", "steps": []}
+        with mock.patch.object(browser, "run_helper", return_value=fake) as run:
             result = self.call(
                 "douyin_publish_video",
                 {
@@ -209,15 +249,15 @@ class TestPublishGate(ServerCase):
                 },
             )
         self.assertEqual(run.call_count, 1)
-        argv = run.call_args.args[1]
-        self.assertEqual(argv[:2], ["douyin", "upload-video"])
-        self.assertIn("--headless", argv)
+        spec = run.call_args.args[1]
+        self.assertEqual(spec["action"], "publish_video")
+        self.assertTrue(spec["headless"])
         self.assertFalse(result["isError"])
         # ★ 不许把"命令成功"说成"已发布上线"
         self.assertIn("审核", self.text_of(result))
 
     def test_plan_id_对不上时拒绝执行(self):
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(browser, "run_helper") as run:
             result = self.call(
                 "douyin_publish_video",
                 {
@@ -238,7 +278,7 @@ class TestPublishGate(ServerCase):
             {"account": "main", "file": "videos/a.mp4", "title": "方案A"},
         )
         plan_id = self.plan_id_of(prep)
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(browser, "run_helper") as run:
             result = self.call(
                 "douyin_publish_video",
                 {
@@ -256,7 +296,7 @@ class TestPublishGate(ServerCase):
         outside = self.root.parent / "outside.mp4"
         outside.write_bytes(b"x")
         try:
-            with mock.patch.object(sau, "run") as run:
+            with mock.patch.object(browser, "run_helper") as run:
                 result = self.call(
                     "douyin_publish_video",
                     {"account": "main", "file": str(outside), "title": "标题"},
@@ -274,8 +314,8 @@ class TestPublishGate(ServerCase):
         )
         plan_id = self.plan_id_of(prep)
         self.assertIn("imgs", self.text_of(prep).replace("\\\\", "/"))
-        fake = sau.SauResult(argv=["sau"], exit_code=0, stdout="ok", stderr="")
-        with mock.patch.object(sau, "run", return_value=fake) as run:
+        fake = {"ok": True, "state": "published", "message": "ok", "steps": []}
+        with mock.patch.object(browser, "run_helper", return_value=fake) as run:
             result = self.call(
                 "douyin_publish_note",
                 {
@@ -286,12 +326,12 @@ class TestPublishGate(ServerCase):
                     "confirm": True,
                 },
             )
-        argv = run.call_args.args[1]
-        self.assertEqual(argv[:2], ["douyin", "upload-note"])
+        spec = run.call_args.args[1]
+        self.assertEqual(spec["action"], "publish_note")
         self.assertFalse(result["isError"])
 
     def test_图文超过35张被拦下(self):
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(browser, "run_helper") as run:
             result = self.call(
                 "douyin_publish_note",
                 {
@@ -305,18 +345,42 @@ class TestPublishGate(ServerCase):
         self.assertIn("35", self.text_of(result))
 
     def test_定时参数进计划且被规范化(self):
+        # ★ 平台要求定时发布至少晚于当前时间 2 小时，所以这里算一个**未来**时间：
+        #   写死日期的话，过一阵子这条用例就会莫名其妙地红（本用例踩过）。
+        import datetime as _dt
+
+        when = (_dt.datetime.now() + _dt.timedelta(days=3)).replace(
+            hour=21, minute=30, second=0, microsecond=0
+        )
         prep = self.call(
             "douyin_publish_video",
             {
                 "account": "main",
                 "file": "videos/a.mp4",
                 "title": "标题",
-                "schedule": "2026-03-24T21:30:00",
+                "schedule": when.strftime("%Y-%m-%dT%H:%M:%S"),
             },
         )
         text = self.text_of(prep)
-        self.assertIn("2026-03-24 21:30", text)
+        self.assertIn(when.strftime("%Y-%m-%d %H:%M"), text)
         self.assertIn("schedule", text)
+
+    def test_定时时间太近被拦下(self):
+        """2 小时内的定时发布平台不认 —— 预检就要拦住，别等上传完才失败。"""
+        import datetime as _dt
+
+        when = _dt.datetime.now() + _dt.timedelta(minutes=30)
+        result = self.call(
+            "douyin_publish_video",
+            {
+                "account": "main",
+                "file": "videos/a.mp4",
+                "title": "标题",
+                "schedule": when.strftime("%Y-%m-%d %H:%M"),
+            },
+        )
+        self.assertTrue(result["isError"])
+        self.assertIn("2 小时", self.text_of(result))
 
 
 class TestPublishParamParity(ServerCase):
@@ -326,7 +390,7 @@ class TestPublishParamParity(ServerCase):
         outside = self.root.parent / "cover.png"
         outside.write_bytes(b"c")
         try:
-            with mock.patch.object(sau, "run") as run:
+            with mock.patch.object(browser, "run_helper") as run:
                 result = self.call(
                     "douyin_publish_video",
                     {
@@ -361,8 +425,8 @@ class TestPublishParamParity(ServerCase):
         for key in ("thumbnail_portrait", "product_link", "product_title", "declaration", "collection"):
             self.assertIn(key, text)
         plan_id = self.plan_id_of(prep)
-        fake = sau.SauResult(argv=["sau"], exit_code=0, stdout="ok", stderr="")
-        with mock.patch.object(sau, "run", return_value=fake) as run:
+        fake = {"ok": True, "state": "published", "message": "ok", "steps": []}
+        with mock.patch.object(browser, "run_helper", return_value=fake) as run:
             result = self.call(
                 "douyin_publish_video",
                 {
@@ -379,9 +443,12 @@ class TestPublishParamParity(ServerCase):
                 },
             )
         self.assertEqual(run.call_count, 1)
-        argv = run.call_args.args[1]
-        for flag in ("--thumbnail-portrait", "--product-link", "--declaration", "--collection"):
-            self.assertIn(flag, argv, argv)
+        spec = run.call_args.args[1]
+        video = spec["video"]
+        self.assertTrue(video["thumbnail_portrait"].endswith("cover.png"))
+        self.assertEqual(video["product_link"], "https://haohuo/detail/1")
+        self.assertEqual(video["declaration"], "虚构演绎，仅供娱乐")
+        self.assertEqual(video["collection"], "我的合集")
         self.assertFalse(result["isError"])
 
     def test_改了声明_旧plan_id失效(self):
@@ -390,7 +457,7 @@ class TestPublishParamParity(ServerCase):
             {"account": "main", "file": "videos/a.mp4", "title": "标题", "declaration": "甲"},
         )
         plan_id = self.plan_id_of(prep)
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(browser, "run_helper") as run:
             result = self.call(
                 "douyin_publish_video",
                 {
@@ -421,8 +488,8 @@ class TestPublishParamParity(ServerCase):
         self.assertIn("note_file", text)
         self.assertIn("bgm", text)
         plan_id = self.plan_id_of(prep)
-        fake = sau.SauResult(argv=["sau"], exit_code=0, stdout="ok", stderr="")
-        with mock.patch.object(sau, "run", return_value=fake) as run:
+        fake = {"ok": True, "state": "published", "message": "ok", "steps": []}
+        with mock.patch.object(browser, "run_helper", return_value=fake) as run:
             self.call(
                 "douyin_publish_note",
                 {
@@ -435,13 +502,13 @@ class TestPublishParamParity(ServerCase):
                     "confirm": True,
                 },
             )
-        argv = run.call_args.args[1]
-        self.assertIn("--notef", argv)
-        self.assertIn("--bgm", argv)
+        spec = run.call_args.args[1]
+        self.assertEqual(spec["note"]["note"], "正文", "note_file 由服务端读成正文再交给自动化")
+        self.assertEqual(spec["note"]["bgm"], "轻快 纯音乐")
 
     def test_正文两种写法同给_预检就拦下(self):
         (self.root / "body.md").write_bytes("正文".encode("utf-8"))
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(browser, "run_helper") as run:
             result = self.call(
                 "douyin_publish_note",
                 {
@@ -458,19 +525,26 @@ class TestPublishParamParity(ServerCase):
 
 
 class TestAccountTools(ServerCase):
-    """账号三件套：状态（退出码判据）、登录（会话式、不阻塞到底）、重置（两步删除）"""
+    """账号三件套：状态（直连探针判据）、登录（会话式、不阻塞到底）、重置（两步删除）"""
 
-    def test_状态用退出码判定(self):
-        with mock.patch.object(
-            sau, "run", return_value=sau.SauResult(argv=["sau"], exit_code=0, stdout="valid", stderr="")
-        ):
+    def _check(self, logged_in=True, output="检查结论"):
+        return mock.patch.object(
+            login_session, "check_account",
+            return_value=AccountCheck(account="main", logged_in=logged_in, ok=True, output=output),
+        )
+
+    def _spawn(self, proc):
+        return mock.patch.object(
+            browser, "spawn_helper", return_value=helper_run(proc, self.root)
+        )
+
+    def test_状态用直连探针判定(self):
+        with self._check(True):
             result = self.call("douyin_account_status", {"account": "main"})
         self.assertIn("logged_in=True", self.text_of(result))
         self.assertFalse(result["isError"])
 
-        with mock.patch.object(
-            sau, "run", return_value=sau.SauResult(argv=["sau"], exit_code=1, stdout="invalid", stderr="")
-        ):
+        with self._check(False, "未登录"):
             result = self.call("douyin_account_status", {"account": "main"})
         text = self.text_of(result)
         self.assertIn("logged_in=False", text)
@@ -478,8 +552,17 @@ class TestAccountTools(ServerCase):
         # ★「未登录」是**正常结论**，不该标成工具错误（否则模型会去重试而不是去登录）
         self.assertFalse(result["isError"])
 
+    def test_状态判不出来时不说成未登录(self):
+        """被风控挡一下 ≠ 没登录：这时给 None，别把人骗去重新扫码。"""
+        with mock.patch.object(
+            login_session, "check_account",
+            return_value=AccountCheck(account="main", logged_in=None, ok=False, output="判不出来"),
+        ):
+            result = self.call("douyin_account_status", {"account": "main"})
+        self.assertIn("logged_in=None", self.text_of(result))
+
     def test_登录_等不到扫码时回报会话仍在等(self):
-        with mock.patch.object(sau, "spawn", return_value=FakeProc(exit_after=None)):
+        with self._spawn(FakeProc(exit_after=None)):
             result = self.call(
                 "douyin_account_login", {"account": "main", "wait_seconds": 0}
             )
@@ -489,15 +572,12 @@ class TestAccountTools(ServerCase):
         self.assertFalse(result["isError"])
 
     def test_登录_扫码成功后再检查一次(self):
-        spawned = FakeProc(exit_after=0, lines=[b"Douyin login flow completed\n"])
-        checked = sau.SauResult(argv=["sau"], exit_code=0, stdout="valid", stderr="")
-        with mock.patch.object(sau, "spawn", return_value=spawned), mock.patch.object(
-            sau, "run", return_value=checked
-        ):
+        spawned = FakeProc(exit_after=0, lines=[login_ok_payload()])
+        with self._spawn(spawned), self._check(True):
             result = self.call(
                 "douyin_account_login", {"account": "main", "wait_seconds": 3}
             )
-            # 会话结束后的自动 check 在守护线程里，给它一点时间
+            # 会话结束后的自动检查在守护线程里，给它一点时间
             self.server.sessions.wait(3)
         self.assertIn("登录成功", self.text_of(result))
         self.assertIs(True, self.server.sessions.snapshot()["loggedIn"])
@@ -505,7 +585,10 @@ class TestAccountTools(ServerCase):
     def test_登录_同刻只保留一个待扫码会话(self):
         first = FakeProc(exit_after=None)
         second = FakeProc(exit_after=None)
-        with mock.patch.object(sau, "spawn", side_effect=[first, second]):
+        with mock.patch.object(
+            browser, "spawn_helper",
+            side_effect=[helper_run(first, self.root), helper_run(second, self.root)],
+        ):
             self.call("douyin_account_login", {"account": "main", "wait_seconds": 0})
             self.call("douyin_account_login", {"account": "main2", "wait_seconds": 0})
         self.assertTrue(first.terminated, "开新会话必须把旧的关掉")
@@ -516,11 +599,11 @@ class TestAccountTools(ServerCase):
 
         def fake_logout(cfg, account, confirm=False):
             calls.append(confirm)
-            return sau.LogoutPlan(
+            return account_mod.LogoutPlan(
                 account=account, path=Path("x.json"), existed=True, deleted=confirm
             )
 
-        with mock.patch.object(sau, "logout", side_effect=fake_logout):
+        with mock.patch.object(account_mod, "logout", side_effect=fake_logout):
             first = self.call("douyin_account_logout", {"account": "main"})
             second = self.call("douyin_account_logout", {"account": "main", "confirm": True})
         self.assertEqual(calls, [False, True], "第一次必须不带 confirm")
@@ -595,7 +678,7 @@ AWEME = {
 
 
 class TestReadTools(unittest.TestCase):
-    """读取工具：登录态来自 sau 的凭据文件，失败要说清"下一步做什么"。
+    """读取工具：登录态来自本服务的凭据文件，失败要说清"下一步做什么"。
 
     ★ 钉两件事：① 风控/没登录**不能**被说成"没搜到"（那会让用户白折腾关键词）；
               ② 输出里只有 cookie 名，没有 cookie 值。
@@ -605,19 +688,21 @@ class TestReadTools(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
-        (self.root / "cookies").mkdir()
+        self.data = self.root / "data"
+        self.data.mkdir()
         self._write_credential()
-        self.cfg = sau.SauConfig(cmd="sau", project_dir=str(self.root), media_dir=str(self.root))
+        self.cfg = config_mod.RuntimeConfig(media_dir=str(self.root))
         self.server = Server(self.cfg)
         import os
 
         env = {k: v for k, v in os.environ.items() if k not in ("DOUYIN_COOKIE", "DOUYIN_COOKIE_FILE")}
+        env["DOUYIN_DATA_DIR"] = str(self.data)
         patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def _write_credential(self):
-        (self.root / "cookies" / "douyin_main.json").write_text(
+        (self.data / "douyin_main.json").write_text(
             json.dumps(
                 {
                     "cookies": [
@@ -667,7 +752,7 @@ class TestReadTools(unittest.TestCase):
         self.assertIn("blocked", text)
 
     def test_没有凭据时给出扫码指引且不泄漏值(self):
-        (self.root / "cookies" / "douyin_main.json").unlink()
+        (self.data / "douyin_main.json").unlink()
         result = self.call("douyin_search_videos", {"keyword": "测试"})
         text = self.text_of(result)
         self.assertTrue(result["isError"])

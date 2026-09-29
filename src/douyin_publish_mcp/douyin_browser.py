@@ -1,4 +1,4 @@
-"""浏览器通道（客户端侧）：直连被 uifid 墙挡住时，用真浏览器把数据取回来。
+﻿"""浏览器通道（客户端侧）：直连被 uifid 墙挡住时，用真浏览器把数据取回来。
 
 ## 它解决什么
 
@@ -57,7 +57,7 @@ from .douyin_web import (
     user_page_from_post,
     video_from_aweme,
 )
-from .sau import SauConfig
+from .config import RuntimeConfig
 
 # ── 落点与来源 ───────────────────────────────────────────────
 
@@ -143,48 +143,36 @@ def _helper_source() -> Optional[Path]:
     return path if path.is_file() else None
 
 
-def _sau_driver_dir(cfg: Optional[SauConfig]) -> Optional[Path]:
-    """复用 sau 虚拟环境里已装好的 patchright（本机已有的那份，省一次下载）。
+def driver_dirs(runtime: Optional[RuntimeConfig] = None) -> List[Path]:
+    """驱动目录候选（按优先级）：显式指定 > 运行时目录（按需下载的落点）
 
-    ★ 只把这个目录挂到**子进程**的 PYTHONPATH 上：它不进我们自己进程的 sys.path，
-      免得第三方依赖（urllib3 之类）反向影响本服务的零依赖前提。
+    ★ v0.3.0 去掉了"顺带复用 social-auto-upload 虚拟环境里的 patchright"那条 ——
+      不再依赖那个项目，也就没有"别人的 venv"可蹭了。缺驱动就按需取（见 ensure_driver）。
     """
-    if cfg is None or not cfg.project_dir:
-        return None
-    venv = Path(cfg.project_dir) / ".venv"
-    candidates = [venv / "Lib" / "site-packages"]                     # Windows
-    candidates += sorted(venv.glob("lib/python*/site-packages"))      # POSIX
-    for path in candidates:
-        if (path / "patchright").is_dir() or (path / "playwright").is_dir():
-            return path
-    return None
-
-
-def driver_dirs(cfg: Optional[SauConfig] = None) -> List[Path]:
-    """驱动目录候选（按优先级）：显式指定 > 运行时目录（按需下载的落点）> sau 虚拟环境"""
     dirs: List[Path] = []
     explicit = (os.environ.get(DRIVER_SITE_ENV) or "").strip()
     if explicit:
         dirs.append(Path(explicit))
     dirs.append(DRIVER_DIR)
-    sau_dir = _sau_driver_dir(cfg)
-    if sau_dir is not None:
-        dirs.append(sau_dir)
     return dirs
 
 
-def resolve_host(cfg: BrowserConfig, sau_cfg: Optional[SauConfig] = None) -> Host:
+def resolve_host(cfg: BrowserConfig, runtime: Optional[RuntimeConfig] = None,
+                 subcommand: str = "--browser-helper") -> Host:
     """决定"谁跑 helper"以及"驱动从哪来"。
 
     - 显式给了 `DOUYIN_BROWSER_PYTHON`：用它跑 `browser_helper.py`（开发/特殊环境用）
-    - 否则：**一律用我们自己当宿主**（冻结后是 exe 的隐藏入口 `--browser-helper`），
-      驱动目录通过 PYTHONPATH 交给子进程 —— 这样 exe 不用长大。
+    - 否则：**一律用我们自己当宿主**（冻结后是 exe 的隐藏入口），驱动目录通过 PYTHONPATH
+      交给子进程 —— 这样 exe 不用长大。
+
+    `subcommand` 决定子进程干哪件事：读取用 `--browser-helper`，
+    登录/发布用 `--creator-helper`（同一份驱动、同一套宿主解析，只有入口不同）。
     """
-    sys_path = [str(p) for p in driver_dirs(sau_cfg) if p.is_dir()]
+    sys_path = [str(p) for p in driver_dirs(runtime) if p.is_dir()]
     explicit_py = (os.environ.get(PYTHON_ENV) or "").strip()
     helper = _helper_source()
 
-    if explicit_py:
+    if explicit_py and subcommand == "--browser-helper":
         if helper is None:  # 冻结后没有 .py 源文件，只能靠 exe 自己当宿主
             raise _unavailable(
                 "设了 DOUYIN_BROWSER_PYTHON，但当前是打包后的 exe，读不到 browser_helper.py 源文件。",
@@ -193,10 +181,14 @@ def resolve_host(cfg: BrowserConfig, sau_cfg: Optional[SauConfig] = None) -> Hos
         return Host([explicit_py, str(helper)], sys_path, "DOUYIN_BROWSER_PYTHON=%s" % explicit_py)
 
     if getattr(sys, "frozen", False):
-        return Host([sys.executable, "--browser-helper"], sys_path, "exe 自宿主")
+        return Host([sys.executable, subcommand], sys_path, "exe 自宿主")
 
     if helper is None:
         raise _unavailable("找不到 browser_helper.py（包不完整）。", "重新安装本服务。")
+    if subcommand != "--browser-helper":
+        # 开发态：创作者助手是包内入口（`python -m douyin_publish_mcp --creator-helper`）
+        return Host([sys.executable, "-m", "douyin_publish_mcp", subcommand], sys_path,
+                    "开发解释器 %s" % Path(sys.executable).name)
     return Host([sys.executable, str(helper)], sys_path, "开发解释器 %s" % Path(sys.executable).name)
 
 
@@ -205,17 +197,17 @@ def _unavailable(message: str, hint: str = "") -> DouyinWebError:
     return DouyinWebError("浏览器通道不可用：" + message, kind="upstream", hint=hint)
 
 
-def driver_ready(cfg: BrowserConfig, sau_cfg: Optional[SauConfig] = None) -> bool:
+def driver_ready(cfg: BrowserConfig, runtime: Optional[RuntimeConfig] = None) -> bool:
     """驱动是否已就位（只看本地，不触发下载）—— 给状态页/自检用。"""
-    return any(p.is_dir() for p in driver_dirs(sau_cfg))
+    return any(p.is_dir() for p in driver_dirs(runtime))
 
 
-def describe(cfg: Optional[BrowserConfig] = None, sau_cfg: Optional[SauConfig] = None) -> str:
+def describe(cfg: Optional[BrowserConfig] = None, runtime: Optional[RuntimeConfig] = None) -> str:
     """一行话说明"这条通道现在能不能用、驱动从哪来"（**不泄漏任何凭据**）"""
     cfg = cfg or BrowserConfig.from_env()
     if not cfg.enabled:
         return "浏览器通道：已关闭（DOUYIN_BROWSER=off）"
-    dirs = [p for p in driver_dirs(sau_cfg) if p.is_dir()]
+    dirs = [p for p in driver_dirs(runtime) if p.is_dir()]
     driver = str(dirs[0]) if dirs else "未就位（首次用到时按需取）"
     return "浏览器通道：启用（先用系统 Chrome 起不来则退自带 chromium）｜驱动：%s" % driver
 
@@ -223,7 +215,7 @@ def describe(cfg: Optional[BrowserConfig] = None, sau_cfg: Optional[SauConfig] =
 # ── 按需取驱动 ───────────────────────────────────────────────
 
 
-def ensure_driver(cfg: BrowserConfig, sau_cfg: Optional[SauConfig] = None) -> Optional[Path]:
+def ensure_driver(cfg: BrowserConfig, runtime: Optional[RuntimeConfig] = None) -> Optional[Path]:
     """按需把驱动准备好，返回新就位的目录（没得可装就返回 None）。
 
     顺序：① 本地归档（离线预置）② 发布源 URL + sha256（**内置默认**，环境变量可覆盖）
@@ -330,6 +322,135 @@ def install_browser(cfg: BrowserConfig, host: Host) -> bool:
 # ── 调用 helper ──────────────────────────────────────────────
 
 
+# ── 通用 helper 通道（读取用 --browser-helper，登录/发布用 --creator-helper）───
+
+
+@dataclass
+class HelperRun:
+    """一次 helper 进程：拿得到 pid、能停、spec 文件要记得删。"""
+
+    proc: subprocess.Popen
+    spec_path: Path
+    host: Host
+
+    def terminate(self, grace: float = 5.0) -> None:
+        try:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        except Exception:  # noqa: BLE001 —— 收尾失败不该往上抛
+            pass
+
+    def cleanup(self) -> None:
+        try:
+            self.spec_path.unlink()
+        except OSError:
+            pass
+
+    def __enter__(self) -> "HelperRun":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.terminate()
+        self.cleanup()
+
+
+def write_spec(spec: Dict[str, Any]) -> Path:
+    handle, raw = tempfile.mkstemp(prefix="douyin-helper-", suffix=".json")
+    os.close(handle)
+    path = Path(raw)
+    # ★ ensure_ascii=False + utf-8：中文文件名/标题要原样传过去（读的时候也是 utf-8）
+    path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def spawn_helper(host: Host, spec: Dict[str, Any]) -> HelperRun:
+    """起一个**长跑**的 helper（登录要等扫码、发布要传大文件，都不能用 run 等它）。"""
+    spec_path = write_spec(spec)
+    try:
+        proc = subprocess.Popen(
+            host.argv + [str(spec_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_child_env(host),
+        )
+    except OSError:
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+        raise
+    return HelperRun(proc=proc, spec_path=spec_path, host=host)
+
+
+def run_helper(host: Host, spec: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    """起一个 helper 并等它那行 JSON（用于"跑完才回来"的动作，如发布）。
+
+    返回 helper 的 payload；进程挂了/超时/没吐 JSON 都变成同形状的失败 payload，
+    调用方不用分别处理"异常"和"错误 JSON"两种情况。
+    """
+    spec_path = write_spec(spec)
+    try:
+        proc = subprocess.run(
+            host.argv + [str(spec_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=_child_env(host),
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "error": {
+                "kind": "timeout",
+                "message": "自动化进程超过 %.0f 秒没回来（发布一般 1~3 分钟，超时说明卡住了）" % timeout,
+                "hint": "到创作者中心「作品管理」确认这次有没有发出去，再决定是否重试。",
+            },
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": {"kind": "host_failed", "message": "起不了自动化进程：%s" % exc, "hint": ""},
+        }
+    finally:
+        try:
+            spec_path.unlink()
+        except OSError:
+            pass
+
+    payload = _last_json_line(proc.stdout or "")
+    if payload is None:
+        tail = (proc.stderr or "").strip().splitlines()[-3:]
+        return {
+            "ok": False,
+            "error": {
+                "kind": "no_result",
+                "message": "自动化进程没吐出结果（退出码 %s）" % proc.returncode,
+                "hint": ("最后几行输出：" + " / ".join(tail)) if tail else "开 DOUYIN_DEBUG=1 重跑看细节。",
+            },
+        }
+    return payload
+
+
+def _last_json_line(text: str) -> Optional[Dict[str, Any]]:
+    """取最后一行 JSON（helper 的进度都走 stderr，stdout 只有标准输出那一行）。"""
+    for line in reversed((text or "").splitlines()):
+        candidate = line.strip()
+        if candidate.startswith("{"):
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return None
+
+
 def _child_env(host: Host) -> Dict[str, str]:
     env = dict(os.environ)
     if host.sys_path:
@@ -396,7 +517,7 @@ def _error_of(payload: Dict[str, Any]) -> Tuple[str, str, str]:
 
 
 def read(cfg: BrowserConfig, cred: Credential, wants: List[Dict[str, Any]],
-         sau_cfg: Optional[SauConfig] = None) -> Dict[str, Any]:
+         runtime: Optional[RuntimeConfig] = None) -> Dict[str, Any]:
     """跑一次浏览器通道，返回 helper 的 payload（含 results/misses）。
 
     按需取驱动与下载 chromium 的重试都收敛在这里：**只在缺东西时多跑一次**，
@@ -404,7 +525,7 @@ def read(cfg: BrowserConfig, cred: Credential, wants: List[Dict[str, Any]],
     """
     if not cfg.enabled:
         raise _unavailable("已被 DOUYIN_BROWSER=off 关闭", "去掉这个环境变量即可启用。")
-    host = resolve_host(cfg, sau_cfg)
+    host = resolve_host(cfg, runtime)
     spec = {
         "storage_state": _storage_state_for(cred),
         "headless": cfg.headless,
@@ -417,7 +538,7 @@ def read(cfg: BrowserConfig, cred: Credential, wants: List[Dict[str, Any]],
 
     kind, _, _ = _error_of(payload)
     if not payload.get("ok") and kind == "no_driver" and cfg.allow_download:
-        new_dir = ensure_driver(cfg, sau_cfg)
+        new_dir = ensure_driver(cfg, runtime)
         if new_dir is not None:
             payload = _invoke(cfg, replace(host, sys_path=host.sys_path + [str(new_dir)]), spec)
             kind, _, _ = _error_of(payload)
@@ -498,13 +619,13 @@ def _fallback_enabled(cfg: BrowserConfig, error: DouyinWebError) -> bool:
 
 
 def video_detail(cfg: BrowserConfig, client: DouyinWebClient, aweme_id: str,
-                 cred: Credential, sau_cfg: Optional[SauConfig] = None) -> Read:
+                 cred: Credential, runtime: Optional[RuntimeConfig] = None) -> Read:
     try:
         return Read(client.video_detail(aweme_id), "直连")
     except DouyinWebError as exc:
         if not _fallback_enabled(cfg, exc):
             raise
-    payload = read(cfg, cred, [{"kind": "video_detail", "aweme_id": str(aweme_id)}], sau_cfg)
+    payload = read(cfg, cred, [{"kind": "video_detail", "aweme_id": str(aweme_id)}], runtime)
     aweme = _body(payload, "video_detail:%s" % aweme_id).get("aweme_detail")
     video = video_from_aweme(aweme) if aweme else {}
     if not video:
@@ -517,26 +638,26 @@ def video_detail(cfg: BrowserConfig, client: DouyinWebClient, aweme_id: str,
 
 
 def user_videos(cfg: BrowserConfig, client: DouyinWebClient, sec_user_id: str,
-                cred: Credential, count: int = 20, sau_cfg: Optional[SauConfig] = None) -> Read:
+                cred: Credential, count: int = 20, runtime: Optional[RuntimeConfig] = None) -> Read:
     try:
         return Read(client.user_videos(sec_user_id, count=count), "直连")
     except DouyinWebError as exc:
         if not _fallback_enabled(cfg, exc):
             raise
     want = {"kind": "user_post", "sec_user_id": str(sec_user_id), "count": count}
-    payload = read(cfg, cred, [want], sau_cfg)
+    payload = read(cfg, cred, [want], runtime)
     return Read(user_page_from_post(_body(payload, "user_post:%s" % sec_user_id)), _note(payload))
 
 
 def user_profile(cfg: BrowserConfig, client: DouyinWebClient, sec_user_id: str,
-                 cred: Credential, sau_cfg: Optional[SauConfig] = None) -> Read:
+                 cred: Credential, runtime: Optional[RuntimeConfig] = None) -> Read:
     try:
         return Read(client.user_profile(sec_user_id), "直连")
     except DouyinWebError as exc:
         if not _fallback_enabled(cfg, exc):
             raise
     want = {"kind": "user_profile", "sec_user_id": str(sec_user_id)}
-    payload = read(cfg, cred, [want], sau_cfg)
+    payload = read(cfg, cred, [want], runtime)
     user = _body(payload, "user_profile").get("user")
     picked = pick_user(user) if user else {}
     if not picked:
@@ -545,13 +666,13 @@ def user_profile(cfg: BrowserConfig, client: DouyinWebClient, sec_user_id: str,
 
 
 def my_profile(cfg: BrowserConfig, client: DouyinWebClient, cred: Credential,
-               sau_cfg: Optional[SauConfig] = None) -> Read:
+               runtime: Optional[RuntimeConfig] = None) -> Read:
     try:
         return Read(client.my_profile(), "直连")
     except DouyinWebError as exc:
         if not _fallback_enabled(cfg, exc):
             raise
-    payload = read(cfg, cred, [{"kind": "my_profile"}], sau_cfg)
+    payload = read(cfg, cred, [{"kind": "my_profile"}], runtime)
     user = _body(payload, "my_profile").get("user")
     picked = pick_user(user) if user else {}
     if not picked:
@@ -576,7 +697,7 @@ class UserPage:
 
 def user_page(cfg: BrowserConfig, client: DouyinWebClient, sec_user_id: str, cred: Credential,
               count: int = 20, include_profile: bool = True, include_videos: bool = True,
-              sau_cfg: Optional[SauConfig] = None) -> UserPage:
+              runtime: Optional[RuntimeConfig] = None) -> UserPage:
     """别人的主页：资料与作品各自"直连优先"，被墙的部分合并成**一次**浏览器抓取。"""
     page = UserPage()
     wants: List[Dict[str, Any]] = []
@@ -602,7 +723,7 @@ def user_page(cfg: BrowserConfig, client: DouyinWebClient, sec_user_id: str, cre
             wants.append({"kind": "user_post", "sec_user_id": str(sec_user_id), "count": count})
 
     if wants:
-        payload = read(cfg, cred, wants, sau_cfg)
+        payload = read(cfg, cred, wants, runtime)
         note = _note(payload)
         if include_profile and not page.user_source:
             user = _body(payload, "user_profile").get("user")
@@ -617,7 +738,7 @@ def user_page(cfg: BrowserConfig, client: DouyinWebClient, sec_user_id: str, cre
 
 
 def self_page(cfg: BrowserConfig, client: DouyinWebClient, cred: Credential, count: int = 20,
-              include_videos: bool = True, sau_cfg: Optional[SauConfig] = None) -> UserPage:
+              include_videos: bool = True, runtime: Optional[RuntimeConfig] = None) -> UserPage:
     """我的主页：资料 + 我的作品。
 
     ★ 自己的作品走的是同一个 `/aweme/post/` 接口，而 `/user/self` 页会自己带 sec_user_id 打它 ——
@@ -650,7 +771,7 @@ def self_page(cfg: BrowserConfig, client: DouyinWebClient, cred: Credential, cou
             wants.append({"kind": "my_profile"})
         if include_videos and not page.videos_source:
             wants.append({"kind": "user_post"})
-        payload = read(cfg, cred, wants, sau_cfg)
+        payload = read(cfg, cred, wants, runtime)
         note = _note(payload)
         if not page.user_source:
             user = _body(payload, "my_profile").get("user")
@@ -665,7 +786,7 @@ def self_page(cfg: BrowserConfig, client: DouyinWebClient, cred: Credential, cou
 
 
 def comments(cfg: BrowserConfig, cred: Credential, aweme_id: str, count: int = 20,
-             sau_cfg: Optional[SauConfig] = None) -> Read:
+             runtime: Optional[RuntimeConfig] = None) -> Read:
     """评论：**没有直连通道**，所以这条只走浏览器。
 
     ★ 顺带说明为什么不做 a_bogus 签名：评论接口确实需要签名（实测不签名→空响应，
@@ -673,7 +794,7 @@ def comments(cfg: BrowserConfig, cred: Credential, aweme_id: str, count: int = 2
       本来就要为它俩建，评论就搭同一条车，省掉一个 V8 引擎和 558KB 混淆 JS 的依赖。
     """
     want = {"kind": "comments", "aweme_id": str(aweme_id), "count": count}
-    payload = read(cfg, cred, [want], sau_cfg)
+    payload = read(cfg, cred, [want], runtime)
     body = _body(payload, "comments:%s" % aweme_id)
     items = [c for c in (body.get("comments") or []) if isinstance(c, dict)]
     picked = [

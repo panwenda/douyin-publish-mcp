@@ -1,4 +1,4 @@
-"""读取通道的单测：凭据解析、请求构造、错误分类、DTO 裁剪。
+﻿"""读取通道的单测：凭据解析、请求构造、错误分类、DTO 裁剪。
 
 ★ 这些用例**不联网**：`urlopen` 全部被打桩。钉的是三条契约：
   ① 凭据只从 sau 的 storage_state / 显式配置里来，缺了就报"去登录"而不是"空结果"；
@@ -87,66 +87,72 @@ class CredentialCase(unittest.TestCase):
             root = Path(tmp)
             explicit = root / "cookie.json"
             explicit.write_text(storage_state([("sessionid", "explicit", ".douyin.com")]), "utf-8")
-            project = root / "sau"
-            (project / "cookies").mkdir(parents=True)
-            (project / "cookies" / "douyin_main.json").write_text(
-                storage_state([("sessionid", "from-sau", ".douyin.com")]), "utf-8"
+            data = root / "data"
+            data.mkdir()
+            (data / "douyin_main.json").write_text(
+                storage_state([("sessionid", "from-data", ".douyin.com")]), "utf-8"
             )
-            from douyin_publish_mcp.sau import SauConfig
+            from douyin_publish_mcp.config import RuntimeConfig
 
-            cfg = SauConfig(project_dir=str(project))
-            with mock.patch.dict("os.environ", {"DOUYIN_COOKIE_FILE": str(explicit)}):
+            cfg = RuntimeConfig()
+            with mock.patch.dict(
+                "os.environ",
+                {"DOUYIN_COOKIE_FILE": str(explicit), "DOUYIN_DATA_DIR": str(data)},
+            ):
                 cred = douyin_cred.resolve_credential(cfg, "main")
-            self.assertIn("explicit", cred.cookie)
+            self.assertIn("explicit", cred.cookie, "显式配置必须压过默认落点")
             self.assertIn("DOUYIN_COOKIE_FILE", cred.source)
 
-    def test_回落到_sau_凭据文件(self):
+    def test_回落到自家数据目录的凭据文件(self):
+        """默认位置是本服务的数据目录（v0.3.0 起自己管登录态，不再依赖别的项目）。"""
         with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp) / "sau"
-            (project / "cookies").mkdir(parents=True)
-            (project / "cookies" / "douyin_main.json").write_text(
-                storage_state([("sessionid", "from-sau", ".douyin.com"), ("ttwid", "t", ".douyin.com")]),
+            data = Path(tmp) / "data"
+            data.mkdir()
+            (data / "douyin_main.json").write_text(
+                storage_state([("sessionid", "from-data", ".douyin.com"), ("ttwid", "t", ".douyin.com")]),
                 "utf-8",
             )
-            from douyin_publish_mcp.sau import SauConfig
+            from douyin_publish_mcp.config import RuntimeConfig
 
-            cfg = SauConfig(project_dir=str(project))
+            cfg = RuntimeConfig()
             env = {k: v for k, v in __import__("os").environ.items()}
             env.pop("DOUYIN_COOKIE_FILE", None)
             env.pop("DOUYIN_COOKIE", None)
+            env["DOUYIN_DATA_DIR"] = str(data)
             with mock.patch.dict("os.environ", env, clear=True):
                 cred = douyin_cred.resolve_credential(cfg, "main")
             self.assertTrue(cred.usable)
-            self.assertIn("sau 凭据文件", cred.source)
+            self.assertIn("数据目录", cred.source)
 
     def test_没有凭据文件时不抛异常而是_empty(self):
-        from douyin_publish_mcp.sau import SauConfig
+        from douyin_publish_mcp.config import RuntimeConfig
 
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = SauConfig(project_dir=str(Path(tmp) / "nope"))
             env = {k: v for k, v in __import__("os").environ.items()}
             env.pop("DOUYIN_COOKIE_FILE", None)
             env.pop("DOUYIN_COOKIE", None)
+            env["DOUYIN_DATA_DIR"] = str(Path(tmp) / "空的")
             with mock.patch.dict("os.environ", env, clear=True):
-                cred = douyin_cred.resolve_credential(cfg, "main")
+                cred = douyin_cred.resolve_credential(RuntimeConfig(), "main")
         self.assertFalse(cred.usable)
         self.assertEqual(cred.cookie, "")
 
-
-    def test_只配_SAU_CMD_时给出补救路径而不是抛异常(self):
-        """只用 SAU_CMD（没有项目目录）时，读取定位不到凭据文件 —— 要指路，不要崩。"""
+    def test_缺凭据时把该去哪儿找说清楚(self):
+        """定位不到凭据要指路（默认落点 + 两条显式替代），不要崩。"""
         import os
 
-        from douyin_publish_mcp.sau import SauConfig
+        from douyin_publish_mcp.config import RuntimeConfig, credential_path
 
-        cfg = SauConfig(cmd=r"C:\some\where\sau.exe")
-        env = {k: v for k, v in os.environ.items()}
-        env.pop("DOUYIN_COOKIE_FILE", None)
-        env.pop("DOUYIN_COOKIE", None)
-        with mock.patch.dict("os.environ", env, clear=True):
-            cred = douyin_cred.resolve_credential(cfg, "main")
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in os.environ.items()}
+            env.pop("DOUYIN_COOKIE_FILE", None)
+            env.pop("DOUYIN_COOKIE", None)
+            env["DOUYIN_DATA_DIR"] = str(Path(tmp) / "空的")
+            with mock.patch.dict("os.environ", env, clear=True):
+                cred = douyin_cred.resolve_credential(RuntimeConfig(), "main")
+                expected = credential_path("main")
         self.assertFalse(cred.usable)
-        self.assertIn("DOUYIN_COOKIE_FILE", cred.describe())
+        self.assertIn(str(expected), cred.describe())
 
 
 class RequestCase(unittest.TestCase):

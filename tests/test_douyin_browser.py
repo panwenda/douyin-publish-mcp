@@ -1,4 +1,4 @@
-"""浏览器通道的单测：宿主/驱动解析、按需取驱动、错误映射、门面的"直连优先"。
+﻿"""浏览器通道的单测：宿主/驱动解析、按需取驱动、错误映射、门面的"直连优先"。
 
 ★ 这些用例**不起浏览器、不联网**：`subprocess.run` 全部被打桩。
   钉的是四条契约：
@@ -464,7 +464,7 @@ class CombinedFacadeTest(unittest.TestCase):
         runs = Completions(FakeProc(payload))
         with mock.patch.object(db.subprocess, "run", runs):
             with mock.patch.object(db, "DRIVER_DIR", self.driver_dir):
-                out = fn(self.cfg, client, *args, self.cred, sau_cfg=None, **kwargs)
+                out = fn(self.cfg, client, *args, self.cred, runtime=None, **kwargs)
         return out, runs
 
     def test_user_page_takes_both_in_one_browser_run(self):

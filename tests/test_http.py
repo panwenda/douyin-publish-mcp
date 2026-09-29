@@ -1,4 +1,4 @@
-"""streamable_http 形态的端到端单测（真起本机服务，再当客户端打它）。
+﻿"""streamable_http 形态的端到端单测（真起本机服务，再当客户端打它）。
 
 钉三件事：
 1. **协议形状**：`POST /mcp` 的 initialize / notifications / tools/* 回得对，
@@ -18,7 +18,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from douyin_publish_mcp import http_server, sau
+from douyin_publish_mcp import account as account_mod
+from douyin_publish_mcp import config as config_mod
+from douyin_publish_mcp import douyin_browser as browser
+from douyin_publish_mcp import http_server
+from douyin_publish_mcp import login_session
+from douyin_publish_mcp.account import AccountCheck
 
 TOOL_NAMES = {
     "douyin_account_status",
@@ -42,7 +47,21 @@ class HttpCase(unittest.TestCase):
         self.root = Path(self._tmp.name)
         (self.root / "videos").mkdir()
         (self.root / "videos" / "a.mp4").write_bytes(b"v" * 16)
-        self.cfg = sau.SauConfig(cmd="sau", media_dir=str(self.root), timeout=60)
+        # 凭据默认落在 DOUYIN_DATA_DIR（本服务自己管登录态）
+        self.data = self.root / "data"
+        self.data.mkdir()
+        (self.data / "douyin_main.json").write_text(
+            '{"cookies":[{"name":"sessionid","value":"x","domain":".douyin.com"},'
+            '{"name":"ttwid","value":"t","domain":".douyin.com"}]}',
+            encoding="utf-8",
+        )
+        env = mock.patch.dict(
+            "os.environ",
+            {"DOUYIN_DATA_DIR": str(self.data), "DOUYIN_COOKIE_FILE": "", "DOUYIN_COOKIE": ""},
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        self.cfg = config_mod.RuntimeConfig(media_dir=str(self.root), timeout=60)
         self.app = http_server.App(self.cfg, token=self.token)
         self.httpd = http_server.ThreadingHTTPServer(("127.0.0.1", 0), http_server.make_handler(self.app))
         self.httpd.daemon_threads = True
@@ -196,7 +215,7 @@ class TestAuth(HttpCase):
 
 class TestPublishGateOverHttp(HttpCase):
     def test_预检不执行发布(self):
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(browser, "run_helper") as run:
             status, _h, body = self.mcp(
                 {
                     "jsonrpc": "2.0",
@@ -227,8 +246,8 @@ class TestPublishGateOverHttp(HttpCase):
             }
         )
         plan_id = re.search(r'plan_id="([0-9a-f]{12})"', prep["result"]["content"][0]["text"]).group(1)
-        fake = sau.SauResult(argv=["sau"], exit_code=0, stdout="ok", stderr="")
-        with mock.patch.object(sau, "run", return_value=fake) as run:
+        fake = {"ok": True, "state": "published", "message": "ok", "steps": []}
+        with mock.patch.object(browser, "run_helper", return_value=fake) as run:
             _s, _h, body = self.mcp(
                 {
                     "jsonrpc": "2.0",
@@ -247,7 +266,7 @@ class TestPublishGateOverHttp(HttpCase):
                 }
             )
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[1][:2], ["douyin", "upload-video"])
+        self.assertEqual(run.call_args.args[1]["action"], "publish_video")
         self.assertFalse(body["result"]["isError"])
 
 
@@ -257,12 +276,12 @@ class TestLoginPage(HttpCase):
         self.assertEqual(status, 200)
         text = data.decode("utf-8")
         self.assertIn("本机状态页", text)
-        self.assertIn("SAU_MEDIA_DIR", text)
+        self.assertIn("DOUYIN_MEDIA_DIR", text)
         self.assertIn("/mcp", text)          # 端点写在页面上，用户能直接粘去客户端
 
     def test_check_动作真的跑起来并落状态(self):
-        fake = sau.SauResult(argv=["sau"], exit_code=0, stdout="valid\n", stderr="")
-        with mock.patch.object(sau, "run", return_value=fake):
+        fake = AccountCheck(account="main", logged_in=True, ok=True, output="已登录")
+        with mock.patch.object(login_session, "check_account", return_value=fake):
             status, headers, _data = self.request(
                 "POST", "/check", raw=b"account=main",
                 token=self.token,
@@ -282,7 +301,7 @@ class TestLoginPage(HttpCase):
         self.assertIn("已登录", st["notice"])
 
     def test_账号名非法被拒且不跑CLI(self):
-        with mock.patch.object(sau, "run") as run:
+        with mock.patch.object(login_session, "check_account") as run:
             _s, _h, _d = self.request("POST", "/check", raw=b"account=bad name;rm -rf")
             time.sleep(0.2)
         run.assert_not_called()
@@ -318,23 +337,26 @@ class TestLoginPage(HttpCase):
         self.assertIn("取消", self.state()["notice"])
 
     def test_重置登录态_页面两步(self):
-        cookies = Path(self.root) / "cookies"
-        cookies.mkdir(exist_ok=True)
-        cred = cookies / "douyin_main.json"
+        data_dir = Path(self.root) / "data"
+        data_dir.mkdir(exist_ok=True)
+        cred = data_dir / "douyin_main.json"
         cred.write_text('{"sessionid":"x"}', encoding="utf-8")
-        # 页面上的 cfg 指向临时目录（见 HttpCase.setUp），这里把它改成"项目目录"
-        self.app.cfg.project_dir = str(self.root)
+        # 凭据默认落点由 DOUYIN_DATA_DIR 决定（v0.3.0 起本服务自己管登录态）
+        env = mock.patch.dict("os.environ", {"DOUYIN_DATA_DIR": str(data_dir)})
+        env.start()
+        try:
+            # 第一步：只看不删
+            status, _h, _d = self.request("POST", "/logout", raw=b"account=main&confirm=0")
+            self.assertEqual(status, 303)
+            self.assertTrue(cred.is_file(), "没确认就不许删")
+            self.assertIn(str(cred), self.state()["notice"])
 
-        # 第一步：只看不删
-        status, _h, _d = self.request("POST", "/logout", raw=b"account=main&confirm=0")
-        self.assertEqual(status, 303)
-        self.assertTrue(cred.is_file(), "没确认就不许删")
-        self.assertIn(str(cred), self.state()["notice"])
-
-        # 第二步：确认后真删
-        self.request("POST", "/logout", raw=b"account=main&confirm=1")
-        self.assertFalse(cred.exists())
-        self.assertIn("已删除", self.state()["notice"])
+            # 第二步：确认后真删
+            self.request("POST", "/logout", raw=b"account=main&confirm=1")
+            self.assertFalse(cred.exists())
+            self.assertIn("已删除", self.state()["notice"])
+        finally:
+            env.stop()
 
     def test_状态页带重置登录态表单(self):
         _s, _h, data = self.request("GET", "/")

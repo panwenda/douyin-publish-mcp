@@ -1,4 +1,4 @@
-"""本机常驻 HTTP 服务（streamable_http 形态）+ 本地状态页。
+﻿"""本机常驻 HTTP 服务（streamable_http 形态）+ 本地状态页。
 
 ## 为什么要有这一半
 
@@ -26,7 +26,7 @@ stdio 形态下，本服务是宿主的**子进程**：宿主一重启就没了�
   （可用 `?token=` 传入，方便用户直接点开）。
 - `/health` 永远免鉴权：启动器靠它判断「起来了没有」，它不含任何业务信息。
 - 页面**只回显路径与状态，绝不读 cookie**；「重置登录态」是唯一的写操作，
-  且两步确认（见 `sau.logout`）。
+  且两步确认（见 `account.logout`）。
 """
 
 from __future__ import annotations
@@ -42,13 +42,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from . import sau
+from . import account as account_mod
 from .douyin_cred import resolve_credential
 from .login_session import LoginSessionManager
-from .sau import SauConfig, SauError
+from .config import ConfigError, RuntimeConfig, credential_path, default_account
 from .server import PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION, Server
 
-# 页面/接口允许的账号名（与 sau 的凭据文件名规则同口径，这里先挡一道）
+# 页面/接口允许的账号名（与凭据文件名规则同口径，这里先挡一道）
 ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -61,7 +61,7 @@ class App:
       工具调用与页面共用，不要在这里再存一份（两份状态一定会分叉）。
     """
 
-    def __init__(self, cfg: SauConfig, token: str = "", host: str = "127.0.0.1", port: int = 18080):
+    def __init__(self, cfg: RuntimeConfig, token: str = "", host: str = "127.0.0.1", port: int = 18080):
         self.cfg = cfg
         self.token = (token or "").strip()
         self.host = host
@@ -115,7 +115,7 @@ class App:
             return
         try:
             snap = self.sessions.start_login(account, headed=headed)
-        except SauError as e:
+        except ConfigError as e:
             self.set_notice(str(e))
             return
         self.set_notice(
@@ -146,15 +146,15 @@ class App:
             finally:
                 self.mark_checking(False)
 
-        threading.Thread(target=worker, name="sau-check", daemon=True).start()
+        threading.Thread(target=worker, name="account-check", daemon=True).start()
 
     def do_logout(self, account: str, confirm: bool) -> None:
         if not ACCOUNT_RE.match((account or "").strip()):
             self.set_notice("账号名只能是字母、数字、下划线、连字符（1~64 位）。")
             return
         try:
-            plan = sau.logout(self.cfg, account, confirm=confirm)
-        except SauError as e:
+            plan = account_mod.logout(self.cfg, account, confirm=confirm)
+        except ConfigError as e:
             self.set_notice(str(e))
             return
         self.set_notice(plan.describe(), is_error=not plan.deleted and plan.existed)
@@ -171,11 +171,11 @@ class App:
         rows = [
             ("MCP 端点", mcp_url),
             ("鉴权", auth_note),
-            ("sau 可执行文件 (SAU_CMD)", cfg.cmd or "（未设置：走 SAU_DIR 或 PATH）"),
-            ("项目目录 (SAU_DIR)", cfg.project_dir or "（未设置）"),
-            ("素材目录 (SAU_MEDIA_DIR)", cfg.media_dir or "（未设置，发布会被拒绝）"),
-            ("默认无头 (SAU_HEADLESS)", "是" if cfg.headless else "否"),
-            ("单次超时 (SAU_TIMEOUT)", "%ds" % cfg.timeout),
+            ("素材目录 (DOUYIN_MEDIA_DIR)", cfg.media_dir or "（未设置，发布会被拒绝）"),
+            ("默认账号 (DOUYIN_ACCOUNT)", cfg.account),
+            ("发布用无头 (DOUYIN_PUBLISH_HEADLESS)", "是" if cfg.headless else "否"),
+            ("浏览器通道 (DOUYIN_CREATOR_CHANNEL)", cfg.channel),
+            ("单次超时 (DOUYIN_TIMEOUT)", "%ds" % cfg.timeout),
             ("短信验证码文件", cfg.verify_code_file or "（未设置）"),
             ("账号凭据文件", _credential_hint(cfg, snap)),
             ("读取通道", _read_channel_hint(cfg, snap)),
@@ -299,13 +299,11 @@ def _state_text(state: Optional[bool]) -> str:
     return "未检查 / 判不出来"
 
 
-def _credential_hint(cfg: SauConfig, snap: Dict[str, Any]) -> str:
+def _credential_hint(cfg: RuntimeConfig, snap: Dict[str, Any]) -> str:
     account = str(snap.get("account") or _default_account())
-    if not cfg.project_dir:
-        return "（未设置 SAU_DIR，定位不到）"
     try:
-        return str(sau.account_file_path(cfg, account))
-    except SauError:
+        return str(credential_path(account))
+    except ConfigError:
         return "（账号名不合规，无法定位）"
 
 
@@ -313,10 +311,10 @@ def _default_account() -> str:
     """页面默认账号名：只读一个显式配置，**不猜**。"""
     import os
 
-    return (os.environ.get("SAU_ACCOUNT") or "main").strip()
+    return default_account()
 
 
-def _read_channel_hint(cfg: SauConfig, snap: Dict[str, Any]) -> str:
+def _read_channel_hint(cfg: RuntimeConfig, snap: Dict[str, Any]) -> str:
     """读取通道现状：给用户看"能不能读、凭什么读"。
 
     ★ 只回显来源与 cookie **名**（[`Credential.describe`] 的约定），
@@ -325,7 +323,7 @@ def _read_channel_hint(cfg: SauConfig, snap: Dict[str, Any]) -> str:
     account = str(snap.get("account") or _default_account())
     try:
         cred = resolve_credential(cfg, account)
-    except SauError as e:
+    except ConfigError as e:
         return "不可用：%s" % e
     if not cred.usable:
         return "不可用（没有凭据）—— 读取工具会提示先扫码登录"
@@ -448,7 +446,7 @@ def make_handler(app: App) -> Callable[..., BaseHTTPRequestHandler]:
                 account = (form.get("account") or [""])[0]
                 if path == "/login":
                     # ★ 与工具一致：状态页登录也弹真窗口（抖音会挑无头浏览器 + 可能要输短信验证码），
-                    #   二维码同时由页面上的 <img> 显示；扫码成功后 sau 会自己关掉窗口
+                    #   二维码同时由页面上的 <img> 显示；扫码成功后辅助进程会自己关掉窗口
                     app.start_login(account, headed=True)
                 elif path == "/check":
                     app.start_check(account)
@@ -502,7 +500,7 @@ def _session_id(existing: Optional[str]) -> str:
     return "%s-%d" % (SERVER_NAME, int(time.time() * 1000))
 
 
-def serve_http(cfg: SauConfig, host: str = "127.0.0.1", port: int = 18080, token: str = "") -> None:
+def serve_http(cfg: RuntimeConfig, host: str = "127.0.0.1", port: int = 18080, token: str = "") -> None:
     """起 HTTP 服务（阻塞；供 `python -m douyin_publish_mcp --http` 调用）。
 
     ★ 绑定非环回地址时**强制**要有 token：这个服务能直接发布内容、持有登录态，

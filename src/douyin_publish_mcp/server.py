@@ -1,4 +1,4 @@
-"""薄 MCP 服务：把 social-auto-upload 的抖音能力封成 5 个工具。
+﻿"""薄 MCP 服务：把 social-auto-upload 的抖音能力封成 5 个工具。
 
 工具：`douyin_account_status` / `douyin_account_login` / `douyin_account_logout` /
 `douyin_publish_video` / `douyin_publish_note`。两种传输共用这一份实现
@@ -38,8 +38,12 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from . import __version__, sau
+from . import __version__
+from . import account as account_mod
+from . import creator_publish
 from . import douyin_browser as browser
+from .creator_publish import PublishAbort
+from .creator_publish import NOTE_TEXT_MAX
 from .douyin_cred import default_account, resolve_credential
 from .douyin_web import (
     DouyinWebClient,
@@ -49,7 +53,7 @@ from .douyin_web import (
     extract_share_url,
 )
 from .login_session import LoginSessionManager
-from .sau import SauConfig, SauError
+from .config import ConfigError, RuntimeConfig, credential_path
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "douyin-publish-mcp"
@@ -362,7 +366,7 @@ def _image_item(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def tool_account_status(
-    cfg: SauConfig, args: Dict[str, Any], sessions: Optional["LoginSessionManager"] = None
+    cfg: RuntimeConfig, args: Dict[str, Any], sessions: Optional["LoginSessionManager"] = None
 ) -> Dict[str, Any]:
     """查登录态。
 
@@ -396,20 +400,20 @@ def tool_account_status(
         )
     else:
         summary = (
-            f"检查失败（退出码不是 0/1）。先看下面的输出：若是找不到命令，"
-            f"说明本服务的 SAU_CMD / SAU_DIR 没配对；若是浏览器/网络错误，多半需要重新登录。"
+            "检查没跑通。先看下面的输出：若是网络/DNS 问题，确认这台机器能不能访问抖音；"
+            "若是凭据文件读不了，重新扫码登录一次。"
         )
-    argv = " ".join(cfg.command(sau.check_args(account)))
     return _text(
         f"{summary}\n\n"
-        f"（判据：`sau douyin check` 的退出码优先（0=valid / 1=invalid），输出文本兜底）\n"
-        f"logged_in={state}\n$ {argv}\n{rec.output or '(无输出)'}",
+        f"（判据：直连探针 /aweme/v1/web/user/profile/self/ —— 能拿到自己的资料就是有效；"
+        f"被风控挡住时如实说「判不出来」，不猜）\n"
+        f"logged_in={state}\n{rec.output or '(无输出)'}",
         is_error=not rec.ok and state is None,
     )
 
 
 def tool_account_login(
-    cfg: SauConfig, args: Dict[str, Any], sessions: Optional["LoginSessionManager"] = None
+    cfg: RuntimeConfig, args: Dict[str, Any], sessions: Optional["LoginSessionManager"] = None
 ) -> Dict[str, Any]:
     """扫码登录：发起（或复用）一个待扫码会话，等一小段，再把状态回报。
 
@@ -420,8 +424,7 @@ def tool_account_login(
     account = _require_str(args, "account")
     # ★ 默认**有头**（真窗口）：登录这一步抖音的反自动化会挑无头浏览器，
     #   而且可能要求短信二次验证 —— 那只能在窗口里手动输，无头做不到。
-    #   窗口不会久留：sau 扫码成功后存完 cookie 就关掉浏览器并退出进程
-    #   （见 douyin_cookie_gen 的 finally 里 browser.close()），没人扫也最多等 2 分钟。
+    #   窗口不会久留：扫码成功后存完凭据就关掉浏览器并退出进程，没人扫也最多等几分钟。
     headed = bool(args.get("headed", True))
     wait_seconds = _bounded_float(args.get("wait_seconds"), default=90.0, lo=0.0, hi=600.0)
     sessions = sessions or LoginSessionManager(cfg)
@@ -462,10 +465,10 @@ def tool_account_login(
     else:
         lines.append(
             f"登录流程失败（退出码 {snap.get('exitCode')}）。{snap.get('error') or ''}\n"
-            f"常见原因：浏览器运行时没装好（patchright install chromium）、"
-            f"或账号名与项目里登录时用的不一致。"
+            f"常见原因：这台机器上没有 Chrome（装一个就行）、浏览器驱动没就位、"
+            f"或窗口被提前关掉了。"
         )
-        lines.append(f"也可让用户在本机终端手动执行：{_manual_login_cmd(cfg, account)}")
+        lines.append(_manual_login_hint(cfg, account))
 
     qr_path = snap.get("qrPath") or ""
     if qr_path:
@@ -482,7 +485,7 @@ def tool_account_login(
     return {"content": content, "isError": False}
 
 
-def tool_account_logout(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_account_logout(cfg: RuntimeConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     """重置登录态（= 删除该账号的凭据文件）。
 
     ★ 两步门禁与发布同源：不传 confirm 只回报「将要删除什么」，一个字节都不动。
@@ -490,7 +493,7 @@ def tool_account_logout(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     """
     account = _require_str(args, "account")
     confirm = bool(args.get("confirm", False))
-    plan = sau.logout(cfg, account, confirm=confirm)
+    plan = account_mod.logout(cfg, account, confirm=confirm)
     lines = [plan.describe()]
     if plan.existed and not plan.deleted:
         lines.append("用户明确同意后，用同一个 account 加上 confirm=true 再调用一次，才会真的删除。")
@@ -502,108 +505,122 @@ def tool_account_logout(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     return _text("\n\n".join(lines), is_error=False)
 
 
-def _publish_tool(cfg: SauConfig, args: Dict[str, Any], kind: str) -> Dict[str, Any]:
+def _publish_tool(cfg: RuntimeConfig, args: Dict[str, Any], kind: str) -> Dict[str, Any]:
     """发布工具的两个阶段（预检 / 执行）共用实现。
 
     `kind`: "video" | "note"
     """
     confirm = bool(args.get("confirm", False))
     plan_id = str(args.get("plan_id", "") or "").strip()
+    # ★ 账号在预检阶段就取：两个阶段的 plan_id 必须能对上同一个账号
+    account = _require_str(args, "account")
 
     # ── 阶段一：把参数变成一份"可信的计划"（顺带把该报的错都报掉）──
+    # ★ 这一步**完全不碰账号**：只校验本地东西（文件在不在、标题长度、时间格式）。
+    #   所以用户改一个字就重新预检一次，代价只有几毫秒。
     try:
         if kind == "video":
-            account = _require_str(args, "account")
-            file_path = sau.resolve_media_path(cfg, _require_str(args, "file"))
+            file_path = cfg.resolve_media_path(_require_str(args, "file"))
             title = _require_str(args, "title")
             description = str(args.get("description", "") or "")
+            tags = [str(t) for t in (args.get("tags") or [])]
             schedule = str(args.get("schedule", "") or "")
             # ★ 封面也走素材白名单：它同样是"把本机文件交给抖音"，只是不叫"主素材"而已
             thumbs: Dict[str, str] = {}
             for key in ("thumbnail_portrait", "thumbnail_landscape"):
                 raw = _opt_str(args, key)
                 if raw:
-                    thumbs[key] = str(sau.resolve_media_path(cfg, raw))
+                    thumbs[key] = str(cfg.resolve_media_path(raw))
             product_link = _opt_str(args, "product_link")
             product_title = _opt_str(args, "product_title")
             declaration = _opt_str(args, "declaration")
             collection = _opt_str(args, "collection")
-            plan: Dict[str, Any] = {"kind": kind, "account": account, "file": str(file_path)}
+            creator_publish.check_titles(title, description, tags)
+            plan: Dict[str, Any] = {"kind": kind, "account": account, "file": str(file_path), "title": title}
             if description:
                 plan["description"] = description
-            if schedule:
-                plan["schedule"] = sau.normalize_schedule(schedule)
-            tags = args.get("tags")
             if tags:
                 plan["tags"] = tags
+            if schedule:
+                plan["schedule"] = creator_publish.normalize_schedule(schedule)
             plan.update(thumbs)
             if product_link:
+                if not product_title:
+                    raise ConfigError("带货商品要链接和短标题**一起**给（只给一个平台不认）。")
                 plan["product_link"] = product_link
                 plan["product_title"] = product_title
             if declaration:
                 plan["declaration"] = declaration
             if collection:
                 plan["collection"] = collection
-            argv_args = sau.upload_video_args(
-                account,
-                str(file_path),
-                title,
-                description,
-                tags,
-                schedule,
-                headless=cfg.headless,
-                thumbnail=thumbs.get("thumbnail_portrait", ""),
-                thumbnail_portrait=thumbs.get("thumbnail_portrait", ""),
-                thumbnail_landscape=thumbs.get("thumbnail_landscape", ""),
-                product_link=product_link,
-                product_title=product_title,
-                declaration=declaration,
-                collection=collection,
-            )
-            # 标题进计划（`upload_video_args` 会顺手校验长度/单行）
-            plan["title"] = title
+            spec_payload: Dict[str, Any] = {
+                "video": {
+                    "path": str(file_path),
+                    "title": title,
+                    "description": description,
+                    "tags": tags,
+                    "schedule": plan.get("schedule", ""),
+                    "thumbnail_portrait": thumbs.get("thumbnail_portrait", ""),
+                    "thumbnail_landscape": thumbs.get("thumbnail_landscape", ""),
+                    "product_link": product_link,
+                    "product_title": product_title,
+                    "declaration": declaration,
+                    "collection": collection,
+                }
+            }
+            action = "publish_video"
         else:
-            account = _require_str(args, "account")
             raw_images = args.get("images")
             if not isinstance(raw_images, list) or not raw_images:
-                raise SauError("images 必须是非空数组（至少一张图片）")
+                raise ConfigError("images 必须是非空数组（至少一张图片）")
             if len(raw_images) > MAX_NOTE_IMAGES:
-                raise SauError(
+                raise ConfigError(
                     f"图片 {len(raw_images)} 张，超过抖音图文上限 {MAX_NOTE_IMAGES} 张，请先筛选。"
                 )
-            images = [str(sau.resolve_media_path(cfg, str(p))) for p in raw_images]
+            images = [str(cfg.resolve_media_path(str(p))) for p in raw_images]
             title = _require_str(args, "title")
             note = str(args.get("note", "") or "")
             note_file = _opt_str(args, "note_file")
-            note_file_path = str(sau.resolve_media_path(cfg, note_file)) if note_file else ""
+            if note and note_file:
+                raise ConfigError("正文只能给一种：note（直接给文本）或 note_file（从文件读）。")
+            note_from_file = ""
+            if note_file:
+                # ★ 服务端把文件读成文本再交给自动化：正文是"内容"不是"文件"，
+                #   少一个能把任意路径交给浏览器的口子。
+                note_from_file = str(cfg.resolve_media_path(note_file))
+                note = Path(note_from_file).read_text(encoding="utf-8", errors="replace")
+            if len(note) > NOTE_TEXT_MAX:
+                raise ConfigError(f"正文最多 {NOTE_TEXT_MAX} 个字（当前 {len(note)} 个）。")
             bgm = _opt_str(args, "bgm")
             schedule = str(args.get("schedule", "") or "")
-            plan = {"kind": kind, "account": account, "images": images}
+            tags = [str(t) for t in (args.get("tags") or [])]
+            creator_publish.check_titles(title, note, tags)
+            plan = {"kind": kind, "account": account, "images": images, "title": title}
             if note:
                 plan["note"] = note
-            if note_file_path:
-                plan["note_file"] = note_file_path
+            if note_from_file:
+                plan["note_file"] = note_from_file
             if bgm:
                 plan["bgm"] = bgm
             if schedule:
-                plan["schedule"] = sau.normalize_schedule(schedule)
-            tags = args.get("tags")
+                plan["schedule"] = creator_publish.normalize_schedule(schedule)
             if tags:
                 plan["tags"] = tags
-            argv_args = sau.upload_note_args(
-                account,
-                images,
-                title,
-                note,
-                tags,
-                schedule,
-                headless=cfg.headless,
-                note_file=note_file_path,
-                bgm=bgm,
-            )
-            plan["title"] = title
-    except SauError as e:
+            spec_payload = {
+                "note": {
+                    "images": images,
+                    "title": title,
+                    "note": note,
+                    "tags": tags,
+                    "schedule": plan.get("schedule", ""),
+                    "bgm": bgm,
+                }
+            }
+            action = "publish_note"
+    except (ConfigError, PublishAbort) as e:
         return _text(f"参数有问题，**没有发任何东西**：\n{e}", True)
+    except OSError as e:  # note_file 读不了之类
+        return _text(f"参数有问题，**没有发任何东西**：读不了文件（{e}）", True)
 
     fingerprint = plan_fingerprint(plan)
 
@@ -628,27 +645,69 @@ def _publish_tool(cfg: SauConfig, args: Dict[str, Any], kind: str) -> Dict[str, 
             True,
         )
 
-    # 真到这一步：执行 CLI
-    result = sau.run(cfg, argv_args, timeout=cfg.timeout)
-    text = sau.redact(result.tail())
-    head = f"$ {' '.join(result.argv)}"
-    if result.ok:
+    # ── 真到这一步：起自动化进程（唯一会碰账号的一步）──
+    cred = resolve_credential(cfg, account)
+    cred_file = Path(cred.path) if cred.path else Path(credential_path(account))
+    if not cred_file.is_file():
+        return _text(
+            "**没有发布**：找不到可用的登录态文件，先登录。\n"
+            f"账号「{account}」要用的文件：{cred_file}\n"
+            "下一步：调用 douyin_account_login 让用户扫码（扫完登录态就写在那儿）。\n"
+            "（只给一串 cookie 的 DOUYIN_COOKIE 方式只能用于读取：发布需要完整的 storage_state 文件。）",
+            True,
+        )
+
+    spec: Dict[str, Any] = {
+        "action": action,
+        "account": account,
+        "credential_path": str(cred_file),
+        "channel": cfg.channel,
+        "headless": cfg.headless,
+        "timeout_sec": cfg.timeout,
+        "verify_code_file": cfg.verify_code_file,
+        "debug": cfg.debug,
+    }
+    spec.update(spec_payload)
+    try:
+        host = browser.resolve_host(browser.BrowserConfig.from_env(), cfg, subcommand="--creator-helper")
+        payload = browser.run_helper(host, spec, timeout=cfg.timeout + 60)
+    except ConfigError as e:
+        return _text(f"发布没起来：{e}", True)
+    except Exception as e:  # noqa: BLE001 —— 起进程失败也要给人话
+        return _text(f"发布没起来（{type(e).__name__}: {e}）。装个 Chrome、确认驱动就位后重试。", True)
+    return _render_publish_result(payload, kind, plan)
+
+
+def _render_publish_result(payload: Dict[str, Any], kind: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+    """把自动化那行 JSON 变成给人看的话。
+
+    ★ 措辞上守两条：① "提交成功" ≠ "已发布上线"（抖音还有审核）；
+      ② `uncertain`（点过发布但没等到成功页）必须说清"可能已经发出去了"，
+      绝不能让人以为"没发出去"而再来一次。
+    """
+    label = "视频" if kind == "video" else "图文"
+    steps = [s for s in (payload.get("steps") or []) if isinstance(s, dict)]
+    warnings = [str(w) for w in (payload.get("warnings") or []) if w]
+
+    if payload.get("ok"):
         body = (
-            "发布命令执行成功（CLI 未报错）。\n"
+            f"{label}已提交发布：{payload.get('message') or plan.get('title') or ''}\n"
             "★ 这不等于作品已公开可见：抖音侧还有审核。请让用户到创作者中心「作品管理」核对，"
-            "不要把「命令成功」说成「已发布上线」。"
+            "不要把「提交成功」说成「已发布上线」。"
         )
-    elif result.timed_out:
-        body = result.hint
     else:
-        body = (
-            f"发布失败（退出码 {result.exit_code}）。常见原因：cookie 失效（先跑 "
-            f"douyin_account_status / douyin_account_login）、素材格式不被接受、"
-            f"或触发了短信二次验证（把验证码写进 verify_code_file 后重试）。"
+        err = payload.get("error") or {}
+        body = f"{label}没发成功（{err.get('kind', 'unknown')}）：{err.get('message', '(没有说明)')}"
+        if err.get("hint"):
+            body += "\n" + str(err["hint"])
+    if steps:
+        body += "\n\n过程：\n" + "\n".join(
+            "· %s%s" % (s.get("step", ""), ("：" + str(s["detail"])) if s.get("detail") else "")
+            for s in steps
         )
-        if cfg.verify_code_file:
-            body += f"\n短信验证码文件：{cfg.verify_code_file}"
-    return _text(f"{body}\n\n{head}\n{text or '(无输出)'}", is_error=not result.ok)
+    if warnings:
+        body += "\n\n需要留意：\n" + "\n".join("· " + w for w in warnings)
+    return _text(body, is_error=not payload.get("ok"))
 
 
 # ── 读取工具（HTTP 直连；登录态与发布共用 sau 的凭据文件）──────────
@@ -658,11 +717,11 @@ def _publish_tool(cfg: SauConfig, args: Dict[str, Any], kind: str) -> Dict[str, 
 # ★ 每个调用新建客户端：cookie 是会被重新扫码替换的，客户端跟着请求走最不容易出脏状态。
 
 
-def _read_client(cfg: SauConfig, args: Dict[str, Any]) -> DouyinWebClient:
+def _read_client(cfg: RuntimeConfig, args: Dict[str, Any]) -> DouyinWebClient:
     return _read_ctx(cfg, args)[0]
 
 
-def _read_ctx(cfg: SauConfig, args: Dict[str, Any]):
+def _read_ctx(cfg: RuntimeConfig, args: Dict[str, Any]):
     """一次读取的上下文：直连客户端 + 凭据 + 浏览器通道参数。
 
     ★ 三样东西必须一起拿：凭据是两条通道共用的（浏览器那份 storage_state 也来自它），
@@ -752,7 +811,7 @@ def _source_note(user_source: str, videos_source: str) -> str:
     return "通道：" + "／".join(parts) + "。直连被风控挡住（403）时自动改用浏览器通道，属正常回退。"
 
 
-def tool_search_videos(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_search_videos(cfg: RuntimeConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     keyword = _require_str(args, "keyword")
     count = _bounded_int(args.get("count"), 10, 1, 20)
     sort = _enum_str(args.get("sort"), SORT_MAP, "general")
@@ -765,7 +824,7 @@ def tool_search_videos(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
             sort_type=SORT_MAP[sort],
             publish_time=PUBLISH_TIME_MAP[publish_time],
         )
-    except SauError as e:
+    except ConfigError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
@@ -784,7 +843,7 @@ def tool_search_videos(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def tool_video_detail(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_video_detail(cfg: RuntimeConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     raw = _require_str(args, "aweme_id")
     # 容错：模型有时会把整条链接塞进 aweme_id
     aweme_id = extract_aweme_id(raw) or raw
@@ -792,14 +851,14 @@ def tool_video_detail(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
         client, cred, browser_cfg = _read_ctx(cfg, args)
         # ★ 作品详情是被 uifid 墙挡着的那个接口：直连 403 时自动回退浏览器通道
         read = browser.video_detail(browser_cfg, client, aweme_id, cred, cfg)
-    except SauError as e:
+    except ConfigError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
     return _text(_render_video(1, read.data) + f"\n\n（{client.sign_note()}｜本次通道：{read.source}）")
 
 
-def tool_user_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_user_profile(cfg: RuntimeConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     sec_user_id = _require_str(args, "sec_user_id")
     include_videos = bool(args.get("include_videos", True))
     limit = _bounded_int(args.get("limit"), 20, 1, 100)
@@ -807,8 +866,8 @@ def tool_user_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
         client, cred, browser_cfg = _read_ctx(cfg, args)
         # ★ 资料与作品在同一个页面、同一次导航里 —— 合成一次抓取，别起两遍浏览器
         page = browser.user_page(browser_cfg, client, sec_user_id, cred, count=limit,
-                                 include_videos=include_videos, sau_cfg=cfg)
-    except SauError as e:
+                                 include_videos=include_videos, runtime=cfg)
+    except ConfigError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
@@ -821,7 +880,7 @@ def tool_user_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     return _text(text + ("\n\n" + note if note else ""))
 
 
-def tool_my_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_my_profile(cfg: RuntimeConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     include_videos = bool(args.get("include_videos", True))
     limit = _bounded_int(args.get("limit"), 20, 1, 100)
     try:
@@ -829,8 +888,8 @@ def tool_my_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
         # ★ 自己的作品列表走同一个 user_videos 接口：/profile/self/ 只给资料，
         #   而"我发了哪些"是用户最常问的一句，所以这里顺手拉一次。
         page = browser.self_page(browser_cfg, client, cred, count=limit,
-                                 include_videos=include_videos, sau_cfg=cfg)
-    except SauError as e:
+                                 include_videos=include_videos, runtime=cfg)
+    except ConfigError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
@@ -843,14 +902,14 @@ def tool_my_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     return _text(text + ("\n\n" + note if note else ""))
 
 
-def tool_parse_share_link(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
+def tool_parse_share_link(cfg: RuntimeConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     share_text = _require_str(args, "share_text")
     try:
         client, cred, browser_cfg = _read_ctx(cfg, args)
         aweme_id = client.resolve_aweme_id(share_text)
         # 分享链接解析出来的是 id，真正的内容还是走详情接口 —— 同样要能回退浏览器
         read = browser.video_detail(browser_cfg, client, aweme_id, cred, cfg)
-    except SauError as e:
+    except ConfigError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
@@ -870,15 +929,15 @@ class Server:
       否则宿主解析 JSON 会立刻失败（这条最容易在加日志时踩到）。
     """
 
-    def __init__(self, cfg: Optional[SauConfig] = None, out=None, err=None):
-        self.cfg = cfg or SauConfig.from_env()
+    def __init__(self, cfg: Optional[RuntimeConfig] = None, out=None, err=None):
+        self.cfg = cfg or RuntimeConfig.from_env()
         self.out = out or sys.stdout
         self.err = err or sys.stderr
         # ★ 登录会话与"最近一次 check"是**进程级共享**的：HTTP 形态下状态页与工具
         #   看到的是同一份状态（同一个 Server 实例），不会出现"页面说在等扫码、
         #   工具说没有会话"这种自相矛盾。
         self.sessions = LoginSessionManager(self.cfg)
-        self.tools: Dict[str, Callable[[SauConfig, Dict[str, Any]], Dict[str, Any]]] = {
+        self.tools: Dict[str, Callable[[RuntimeConfig, Dict[str, Any]], Dict[str, Any]]] = {
             "douyin_account_status": lambda c, a: tool_account_status(c, a, self.sessions),
             "douyin_account_login": lambda c, a: tool_account_login(c, a, self.sessions),
             "douyin_account_logout": tool_account_logout,
@@ -924,7 +983,7 @@ class Server:
                 return _err(req_id, -32602, "arguments 必须是对象")
             try:
                 return _ok(req_id, fn(self.cfg, arguments))
-            except SauError as e:
+            except ConfigError as e:
                 # 参数/环境问题：当成工具错误回给模型（它要转述给用户去改配置）
                 return _ok(req_id, _text(str(e), True))
             except Exception as e:  # noqa: BLE001 —— 兜底：别让宿主看到"服务崩了"
@@ -960,7 +1019,7 @@ def _err(req_id: Any, code: int, message: str) -> Dict[str, Any]:
 def _require_str(args: Dict[str, Any], key: str) -> str:
     value = args.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise SauError(f"缺少必填参数 {key}")
+        raise ConfigError(f"缺少必填参数 {key}")
     return value.strip()
 
 
@@ -979,16 +1038,18 @@ def _bounded_float(value: Any, default: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, num))
 
 
-def _manual_login_cmd(cfg: SauConfig, account: str) -> str:
-    """给用户手敲的登录命令（模型可以把这行原样转述出去）"""
-    # ★ 这里是**人工排查**路径（把命令原样交给用户，让他在自己终端里跑）：
-    #   故意保留 --headed —— 那时用户就在终端前，直接看到窗口里的二维码，
-    #   比让他去目录里翻二维码图片直观。工具走的默认路径是无头。
-    return " ".join(cfg.command(sau.login_args(account, headed=True)))
+def _manual_login_hint(cfg: RuntimeConfig, account: str) -> str:
+    """登录失败时，用户在自己机器上该怎么自己排查（模型可以把这几句原样转述出去）。"""
+    return (
+        "也可以手动跑一次看现场：\n"
+        f"  douyin-publish-mcp --creator-helper <spec>（内部入口，一般不用手敲）\n"
+        f"或者直接用浏览器打开 https://creator.douyin.com/ 扫码 —— 凭据文件在 "
+        f"{credential_path(account)}，登录态就存那儿。"
+    )
 
 
 def main() -> int:
-    cfg = SauConfig.from_env()
+    cfg = RuntimeConfig.from_env()
     print(
         f"[{SERVER_NAME}] 就绪：SAU_CMD={cfg.cmd or '(未设置)'} SAU_DIR={cfg.project_dir or '(未设置)'} "
         f"素材目录={cfg.media_dir or '(未设置)'} 超时={cfg.timeout}s",
