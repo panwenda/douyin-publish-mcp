@@ -486,5 +486,37 @@ class CombinedFacadeTest(unittest.TestCase):
         self.assertEqual([w["kind"] for w in spec["wants"]], ["user_post"])
 
 
+class DriverPathTest(unittest.TestCase):
+    """驱动落点：客户端与 helper 必须是**同一个地方**（分叉了会"取过了还说没驱动"）。"""
+
+    def test_client_and_helper_share_one_definition(self):
+        from douyin_publish_mcp import browser_helper
+
+        self.assertEqual(db.DRIVER_DIR, browser_helper.default_driver_dir())
+        self.assertEqual(db.RUNTIME_DIR, db.DRIVER_DIR.parent)
+
+    def test_helper_finds_runtime_dir_without_any_env(self):
+        # 直接手动跑 helper（没有客户端传 DOUYIN_BROWSER_DRIVER_PATH）时，也要认默认落点
+        from douyin_publish_mcp import browser_helper
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "site-packages"
+            (fake / "patchright").mkdir(parents=True)
+            stripped = {k: v for k, v in os.environ.items() if not k.startswith("DOUYIN_BROWSER")}
+            with mock.patch.dict("os.environ", stripped, clear=True):
+                with mock.patch.object(browser_helper, "default_driver_dir", lambda: fake):
+                    added = browser_helper._extend_sys_path()
+            self.assertIn(str(fake), added)
+            self.assertIn(str(fake), sys.path)
+            sys.path.remove(str(fake))
+
+    def test_missing_driver_is_not_an_error(self):
+        # 目录不存在时静默跳过（"没取驱动"不是崩溃，交给上层的 no_driver 说明）
+        from douyin_publish_mcp import browser_helper
+
+        with mock.patch.object(browser_helper, "default_driver_dir", lambda: Path("Z:/nope/nope")):
+            self.assertEqual(browser_helper._extend_sys_path(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

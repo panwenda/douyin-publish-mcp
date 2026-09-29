@@ -48,6 +48,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .browser_helper import default_driver_dir
 from .douyin_cred import Credential, parse_cookie_header, parse_storage_state
 from .douyin_web import (
     DouyinWebClient,
@@ -61,8 +62,9 @@ from .sau import SauConfig
 # ── 落点与来源 ───────────────────────────────────────────────
 
 #: 驱动/浏览器的运行时目录（与 exe 同级的用户目录，不写进仓库、不随版本分发）
-RUNTIME_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "douyin-publish-mcp" / "browser-runtime"
-DRIVER_DIR = RUNTIME_DIR / "site-packages"
+#: ★ 定义只有一份（在 browser_helper 里）：helper 被直接拉起时也要能找到同一个地方
+DRIVER_DIR = default_driver_dir()
+RUNTIME_DIR = DRIVER_DIR.parent
 
 #: 驱动包来源（我们自己的发布源；待 Gitee 仓库建好后填）
 DRIVER_URL_ENV = "DOUYIN_BROWSER_DRIVER_URL"

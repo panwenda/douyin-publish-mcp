@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pathlib
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -130,13 +131,24 @@ async def _launch(playwright, prefer: str, headless: bool):
     )
 
 
+def default_driver_dir() -> pathlib.Path:
+    """驱动"按需取"的落点（**客户端与 helper 共用的唯一一份定义**）。
+
+    ★ 两处各写一遍迟早分叉，而分叉的表现会很隐蔽：客户端以为驱动在 A、
+      helper 去 B 找，于是"明明取过了还是报没驱动"。
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return pathlib.Path(base) / "douyin-publish-mcp" / "browser-runtime" / "site-packages"
+
+
 def _extend_sys_path() -> List[str]:
     """把驱动目录挂进 sys.path。
 
     ★ 为什么不能只靠 PYTHONPATH：冻结（PyInstaller）之后，本进程的 `sys.path`
       由引导器自己定，**环境变量 PYTHONPATH 不再生效** —— 实测
       `douyin-publish-mcp.exe --browser-helper` 会报 `No module named 'patchright'`。
-      所以由客户端用 `DOUYIN_BROWSER_DRIVER_PATH` 把目录传进来，这里显式插入。
+      所以由客户端用 `DOUYIN_BROWSER_DRIVER_PATH` 把目录传进来，这里显式插入；
+      没传时也认"运行时目录"这个默认落点（这样直接手动跑 helper 调试时行为一致）。
       （纯 Python 包走普通 PathFinder 就能导入；PyInstaller 自己的导入器只管它打包的那些。）
     """
     added: List[str] = []
@@ -144,6 +156,7 @@ def _extend_sys_path() -> List[str]:
         p for p in (
             os.environ.get("DOUYIN_BROWSER_DRIVER_PATH", ""),
             os.environ.get("DOUYIN_BROWSER_SITE_PACKAGES", ""),
+            str(default_driver_dir()),
         ) if p
     )
     for chunk in raw.split(os.pathsep):
@@ -294,7 +307,8 @@ async def _amain(spec_path: str) -> int:
             "error": {
                 "kind": "no_driver",
                 "message": "这个解释器里没有 patchright/playwright：%s" % exc,
-                "hint": "把浏览器驱动放到运行时目录（DOUYIN_BROWSER_SITE_PACKAGES 可显式指定），或让 exe 自己当宿主。",
+                "hint": "浏览器驱动没就位。按需取：落到 %s（zip 内含 patchright/ 即可），"
+                        "或用 DOUYIN_BROWSER_SITE_PACKAGES 指到本机已有的那份。" % default_driver_dir(),
             },
         }
     except Exception as exc:  # noqa: BLE001 —— 兜底：任何异常都要变成一行 JSON，别让调用方解析空气
