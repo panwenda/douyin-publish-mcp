@@ -400,12 +400,33 @@ class DownloadTest(unittest.TestCase):
                             db.ensure_driver(db.BrowserConfig(), None)
             self.assertIn("哈希不匹配", str(ctx.exception))
 
-    def test_no_source_means_no_bootstrap(self):
-        # 三个来源变量都没配 → 不猜、不偷偷从 PyPI 拉，直接交给上层给指引
+    def test_no_source_configured_falls_back_to_builtin_release(self):
+        # ★ 新机器上什么都不配时，缺驱动应该直接走**内置**的发布源（这是"按需取"的意义）
+        calls = []
+
+        def fake_download(url, dst):
+            calls.append(url)
+            dst.write_bytes(b"not a zip at all")   # 故意给垃圾：只为证明它去哪儿取
+
         stripped = {k: v for k, v in os.environ.items()
-                    if k not in (db.DRIVER_URL_ENV, db.DRIVER_ARCHIVE_ENV, db.DRIVER_SHA_ENV)}
+                    if k not in (db.DRIVER_URL_ENV, db.DRIVER_SHA_ENV, db.DRIVER_ARCHIVE_ENV)}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict("os.environ", stripped, clear=True):
+                with mock.patch.object(db, "DRIVER_DIR", Path(tmp) / "site-packages"):
+                    with mock.patch.object(db, "_download", fake_download):
+                        with self.assertRaises(DouyinWebError):
+                            db.ensure_driver(db.BrowserConfig(), None)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("gitee.com/pan-wenda/douyin", calls[0])
+        self.assertIn("douyin-browser-driver-win64-patchright", calls[0])
+
+    def test_download_off_means_no_bootstrap(self):
+        # DOUYIN_BROWSER_DOWNLOAD=0：内网机器宁可报错，也不许偷偷往外发请求
+        stripped = {k: v for k, v in os.environ.items()
+                    if k not in (db.DRIVER_URL_ENV, db.DRIVER_SHA_ENV, db.DRIVER_ARCHIVE_ENV)}
         with mock.patch.dict("os.environ", stripped, clear=True):
-            self.assertIsNone(db.ensure_driver(db.BrowserConfig(), None))
+            with mock.patch.object(db, "_download", lambda url, dst: self.fail("不该发请求")):
+                self.assertIsNone(db.ensure_driver(db.BrowserConfig(allow_download=False), None))
 
 
 class CombinedFacadeTest(unittest.TestCase):

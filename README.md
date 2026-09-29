@@ -218,7 +218,7 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 | 本机已有 | `DOUYIN_BROWSER_SITE_PACKAGES=<site-packages>` | 例如 social-auto-upload 的 `.venv\Lib\site-packages` |
 | 运行时目录 | 默认 `%LOCALAPPDATA%\douyin-publish-mcp\browser-runtime\site-packages` | 下面两种方式都落到这里，之后就不再重复取 |
 | 本地归档 | `DOUYIN_BROWSER_DRIVER_ARCHIVE=<zip>` | 离线/内网预置：zip 内含 `patchright/` 目录 |
-| 发布源 | `DOUYIN_BROWSER_DRIVER_URL` + `DOUYIN_BROWSER_DRIVER_SHA256` | **只信哈希**：不匹配就拒装 |
+| 发布源 | 默认已内置（Gitee 附件 `douyin-browser-driver-win64-patchright-1.58.2.zip` + 哈希）；`DOUYIN_BROWSER_DRIVER_URL` / `DOUYIN_BROWSER_DRIVER_SHA256` 可覆盖 | **只信哈希**：不匹配就拒装（截断过的来源是真实踩过的坑） |
 
 其它开关：
 
@@ -363,20 +363,20 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ---
 
-## 从 GitHub Release 安装（使用者）
+## 从 Release 安装（使用者）
 
-[Releases](https://github.com/panwenda/douyin-publish-mcp/releases) 里只有一个资产：
+发布源（Gitee 镜像，本公司账号）：**https://gitee.com/pan-wenda/douyin**
 
-| 平台 | 文件 |
+| 资产 | 用途 |
 | --- | --- |
-| Windows x64 | `douyin-publish-mcp-windows-amd64.exe` |
-
-它是 PyInstaller **onefile** 单文件（约 9 MB，**自带 Python 运行时，不用先装 Python**）：
+| `douyin-publish-mcp.exe` | 服务本体：PyInstaller **onefile** 单文件，约 10.8 MB，**自带 Python 运行时，不用先装 Python** |
+| `douyin-publish-mcp-win64-onedir.zip` | 整包形态（解压即用；onedir 少一层自解压子进程，停用时更好收） |
+| `douyin-browser-driver-win64-patchright-1.58.2.zip` | 浏览器驱动（**不用手动下**：真缺时服务自己按需取，见下面「浏览器通道」一节） |
 
 ```powershell
 $dst = "$env:LOCALAPPDATA\douyin-publish-mcp"
 New-Item -ItemType Directory -Force $dst | Out-Null
-Move-Item .\douyin-publish-mcp-windows-amd64.exe "$dst\douyin-publish-mcp.exe" -Force
+Move-Item .\douyin-publish-mcp.exe "$dst\douyin-publish-mcp.exe" -Force
 & "$dst\douyin-publish-mcp.exe" --http --port 18080     # 本机常驻，只绑 127.0.0.1
 ```
 

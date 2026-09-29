@@ -66,12 +66,22 @@ from .sau import SauConfig
 DRIVER_DIR = default_driver_dir()
 RUNTIME_DIR = DRIVER_DIR.parent
 
-#: 驱动包来源（我们自己的发布源；待 Gitee 仓库建好后填）
+#: 驱动包来源（我们自己的发布源）
 DRIVER_URL_ENV = "DOUYIN_BROWSER_DRIVER_URL"
 DRIVER_SHA_ENV = "DOUYIN_BROWSER_DRIVER_SHA256"
 DRIVER_ARCHIVE_ENV = "DOUYIN_BROWSER_DRIVER_ARCHIVE"   # 离线预置：本地 zip/whl
 DRIVER_SITE_ENV = "DOUYIN_BROWSER_SITE_PACKAGES"       # 本机已有的驱动目录
 PYTHON_ENV = "DOUYIN_BROWSER_PYTHON"                   # 显式指定宿主解释器
+
+#: 内置的发布源（Gitee 镜像的 Release 附件），环境变量可覆盖。
+#: ★ 为什么要内置：新机器上「缺驱动」不该再要求用户先读文档、配两个变量 ——
+#:   缺了就去取，这才是"exe 保持小 + 按需取驱动"这句话的兑现方式。
+#: ★ 只信哈希：Gitee 附件实测出现过"截断后仍是合法 PE 头"的同款问题，没有哈希就不装。
+DRIVER_URL_DEFAULT = (
+    "https://gitee.com/pan-wenda/douyin/releases/download/v0.2.0/"
+    "douyin-browser-driver-win64-patchright-1.58.2.zip"
+)
+DRIVER_SHA_DEFAULT = "8a6de597f21574094d93ee86a1e965330fae32b29aaec458385abd5ae880b03d"
 
 _HELPER_NAME = "browser_helper.py"
 
@@ -215,17 +225,19 @@ def describe(cfg: Optional[BrowserConfig] = None, sau_cfg: Optional[SauConfig] =
 def ensure_driver(cfg: BrowserConfig, sau_cfg: Optional[SauConfig] = None) -> Optional[Path]:
     """按需把驱动准备好，返回新就位的目录（没得可装就返回 None）。
 
-    顺序：① 本地归档（离线预置）② 我们自己的发布源 URL + sha256 ③ 放弃（上层给指引）。
+    顺序：① 本地归档（离线预置）② 发布源 URL + sha256（**内置默认**，环境变量可覆盖）
+    ③ 放弃（上层给指引，告诉用户去哪儿放）。
 
     ★ 只信哈希：来源可能被截断（本项目在 exe 分发上就撞到过"截断后仍是合法 PE 头"），
       没有哈希就不装，宁可报错让人去配 DOUYIN_BROWSER_SITE_PACKAGES。
+    ★ `DOUYIN_BROWSER_DOWNLOAD=0` 一票否决：内网机器宁可报错，也不许偷偷往外发请求。
     """
     archive_src = (os.environ.get(DRIVER_ARCHIVE_ENV) or "").strip()
-    url = (os.environ.get(DRIVER_URL_ENV) or "").strip()
-    sha = (os.environ.get(DRIVER_SHA_ENV) or "").strip()
+    url = (os.environ.get(DRIVER_URL_ENV) or DRIVER_URL_DEFAULT).strip()
+    sha = (os.environ.get(DRIVER_SHA_ENV) or DRIVER_SHA_DEFAULT).strip()
     if not archive_src and not (url and sha):
         return None
-    if not cfg.allow_download and url:
+    if not cfg.allow_download and not archive_src:
         return None
 
     DRIVER_DIR.parent.mkdir(parents=True, exist_ok=True)
