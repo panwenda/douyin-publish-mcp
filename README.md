@@ -47,19 +47,40 @@
 
 ---
 
-## 前置：把 social-auto-upload 跑起来
+## 前置：把 social-auto-upload 跑起来（**每台要用它的机器都要做一遍**）
+
+sau **不在本包里**：本服务是个薄壳，运行时调的是你机器上的 `sau` 命令。
+所以下面这 4 步不是"部署者做一次"，而是**每个用户在自己的机器上各做一遍**
+（登录态更是天然按人、按账号分开的）。
 
 ```bash
 git clone https://github.com/dreammis/social-auto-upload.git
 cd social-auto-upload
 uv sync
 uv pip install -e .                      # 生成 sau 命令入口
-patchright install chromium              # 浏览器运行时
+cp conf.example.py conf.py               # ★ 必须做：sau_cli.py 第一行就是 from conf import BASE_DIR
+patchright install chromium              # 浏览器运行时（约 150MB，装一次）
 uv run sau douyin login --account main   # 先手动登录一次，确认整条链路通
 ```
 
-> Windows 上装 Chromium 建议先设镜像：
-> `$env:PLAYWRIGHT_DOWNLOAD_HOST="https://npmmirror.com/mirrors/playwright"`
+几个容易踩的点：
+
+- **`conf.py` 不在仓库里**（要从 `conf.example.py` 复制），漏了这步 sau 会直接 `ImportError`；
+  而且 `BASE_DIR = conf.py 所在目录`，**不能用环境变量覆盖** —— 所以 `cookies/` 就落在
+  clone 下来的那个目录里，凭据位置才可预期。
+  ⚠️ 反过来：若 sau 是从内网 PyPI / 归档**装成包**（非 editable），`BASE_DIR` 会变成包安装目录，
+  `cookies/` 就写进缓存里（会被清理、也不好备份）—— 这也是本服务主推 `SAU_DIR` / `SAU_CMD` 的原因。
+- **`uv` 要是能用的**：本服务是用 `uv run --directory <SAU_DIR>` 拉起 sau 的。客户端内置的 uv
+  只用于把商店条目里 `command=uvx` 换成本机内嵌版本，**不会**替我们 spawn 的 `uv run` 兜底 ——
+  所以机器上要么有 `uv`，要么把 `SAU_UV` 写成 uv.exe 的绝对路径（不如直接用 `SAU_CMD` 稳）。
+- **Chromium 是独立一步**：`uv pip install -e .` 不会装它。`conf.py` 里的 `LOCAL_CHROME_PATH`
+  可以指向系统已装的 Chrome（能否省掉那份 150MB 下载待实测）。
+- Windows 上装 Chromium 建议先设镜像：
+  `$env:PLAYWRIGHT_DOWNLOAD_HOST="https://npmmirror.com/mirrors/playwright"`
+
+> 想让"其他用户零手工"，只能靠三件事之一：① 把上面这些做成一个可复制的安装脚本/引导
+> （商店目前没有"安装后执行 prepare 命令"的能力）；② 把 sau 环境 + Chromium 一起预置分发；
+> ③ 集中部署一台机器走 http 形态给别人连（但凭据与账号归属都在那台机器上，只适合共享账号的场景）。
 
 ---
 
@@ -152,24 +173,68 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 
 ---
 
-## 读取能力怎么来（与小红书 MCP 的差别）
+## 读取能力怎么来（三条通道，逐级回退）
 
-读取（搜索 / 详情 / 主页 / 分享解析）**不走浏览器**，本服务直接用标准库请求抖音 web 接口：
+读取不"一刀切用浏览器"：先**直连**，被风控挡住才回退**浏览器通道**，两者都拿不到才如实报错。
 
-| | 小红书 MCP | 本服务的读取 |
+| 通道 | 用什么 | 覆盖的接口 |
 | --- | --- | --- |
-| 数据来源 | 真实浏览器渲染（go-rod + 内置 Chromium） | 抖音 web 接口直连（标准库 `urllib`） |
-| 取舍 | 稳，但每次读取要起浏览器、要背一份 Chromium | 快、零依赖；依赖"登录 cookie + 请求指纹"，平台改版可能失效 |
-| 登录态 | 自己的 `cookies.json`（绑指纹 seed） | **复用 sau 的** `<项目>/cookies/douyin_<账号>.json` |
+| ① 直连 | 标准库 `urllib` 打抖音 web 接口 | 搜索、用户主页、我的主页（实测各 5/5，亚秒级） |
+| ② 浏览器 | patchright 驱动**系统 Chrome**：先导航到页面，再抓抖音**自己发的**响应 | **作品详情、用户作品**（这两个接口的墙是 uifid 设备指纹：直连 0/5、带签名同样 403）、评论 |
+| ③ 都没有 | —— | 如实报 `blocked` 并给"下一步做什么"，不影响其它工具 |
 
-- **不用二次登录**：扫码一次，发布与读取共用同一份凭据（少一个会过期、要单独清理的东西）。
-- **不回显凭据**：工具输出与状态页只出现 cookie 的**名字**（`sessionid`、`ttwid`…），值不出现。
-- **失效时是什么样**：`{"status_code":0,"status_msg":"blocked"}`。读取工具把它与"真没搜到"分开报，
-  并按顺序提示排查：① cookie 里有没有 `ttwid` ② `sessionid` 是否过期（重新扫码）
-  ③ 是否为无签名直连被拦（见下）。
-- **签名**：`a_bogus` **当前不携带**（`douyin_sign.A_BOGUS_IMPLEMENTED = False`）。
-  带登录 cookie 时多数接口不校验它；真被拦了，在 `douyin_sign.sign_a_bogus` 里补实现即可，
-  调用方一行都不用改。
+★ 为什么不是"在页面里发 fetch"：实测裸 `fetch` 回放 → `403 Uifid Not Found`；
+手工补上抓到的真 uifid（真值 60 字符）→ `403 Signature Not Found`。`uifid` 与 `a_bogus`
+是抖音**自己的请求封装**注入的，原生 fetch 绕不过去；而它自己发起的请求
+（打开 `/video/<id>`、`/user/<sec_uid>` 时触发的 XHR）全是 200。
+所以浏览器通道的形态是**导航 + 抓它自己的响应**（且必须在 response 回调里**立刻**读 body，
+晚一步 body 就释放了）。
+
+★ 为什么不做 a_bogus 签名（不引 V8 引擎）：评论接口确实需要签名（实测不签名→空响应、
+带签名→200），但**作品详情/用户作品那堵墙签名救不了**（第三方实现带签名同样 403）。
+既然浏览器通道本来就要为它俩而建，评论就搭同一条车 —— 省掉一个 V8 引擎和 558KB 混淆 JS 的依赖。
+
+★ 成本：一次浏览器抓取实测 0.4~5 秒（冷启 + 等页面自己发请求，同一页面上的多条需求合并成一次导航）；
+直连是亚秒。所以回退只在 `blocked` 时发生，**能直连的接口不会平白多等**。
+工具输出里只在真回退过时附一句"通道：…"。
+
+### 浏览器通道的依赖怎么来（exe 保持小 + 按需取驱动）
+
+| 组成 | 从哪来 | 体积 |
+| --- | --- | --- |
+| 宿主 | **本服务自己**：`douyin-publish-mcp.exe --browser-helper <spec>`（隐藏入口，不在 `--help` 里） | 0 |
+| 驱动 | patchright（纯 Python，含 node driver）—— 取法见下表 | ~90MB，**按需** |
+| 浏览器 | **系统 Chrome 优先**（实测 153.x 够用）；起不来退自带 chromium；都没有才下载 | 0（默认路线） |
+
+★ 冻结（PyInstaller）后有个坑：`PYTHONPATH` 对 exe **不生效**，所以客户端用
+`DOUYIN_BROWSER_DRIVER_PATH` 把驱动目录传给 helper，由 helper 自己插进 `sys.path`
+（实测不这么做就是 `No module named 'patchright'`）。同理，打包时要带上整份标准库，
+否则运行期挂上来的 patchright 会 `No module named 'uuid'`。
+
+驱动的取用顺序（**只在真的要用、又真的缺**时才动；一个来源都没有就明确报错，不猜、不偷偷拉 PyPI）：
+
+| 来源 | 怎么配 | 说明 |
+| --- | --- | --- |
+| 本机已有 | `DOUYIN_BROWSER_SITE_PACKAGES=<site-packages>` | 例如 social-auto-upload 的 `.venv\Lib\site-packages` |
+| 运行时目录 | 默认 `%LOCALAPPDATA%\douyin-publish-mcp\browser-runtime\site-packages` | 下面两种方式都落到这里，之后就不再重复取 |
+| 本地归档 | `DOUYIN_BROWSER_DRIVER_ARCHIVE=<zip>` | 离线/内网预置：zip 内含 `patchright/` 目录 |
+| 发布源 | `DOUYIN_BROWSER_DRIVER_URL` + `DOUYIN_BROWSER_DRIVER_SHA256` | **只信哈希**：不匹配就拒装 |
+
+其它开关：
+
+| 变量 | 作用 |
+| --- | --- |
+| `DOUYIN_BROWSER=off` | 完全关掉浏览器通道（只留直连） |
+| `DOUYIN_BROWSER_CHANNEL` | `auto`（默认：先系统 Chrome）/ `chrome` / `chromium` |
+| `DOUYIN_BROWSER_HEADFUL=1` | 有头运行（**调试用**：看页面到底显示了什么） |
+| `DOUYIN_BROWSER_DOWNLOAD=0` | 禁止任何自动下载（驱动包 / chromium） |
+| `DOUYIN_BROWSER_TIMEOUT_MS` | 等目标接口响应上限（默认 45000） |
+
+**静默与边界**：默认无头、不弹窗口；helper 起-抓-关，不留常驻进程。
+但"无感"≠"无痕" —— 调用那几秒任务管理器里会出现 `chrome.exe`（用完即退）；
+本服务不做隐藏进程、不做反检测规避。
+
+**内网机器注意**：驱动要预置（本地归档或运行时目录），浏览器要有（系统 Chrome 或自带 chromium 任一）。
 
 ### 端到端验收：`scripts/verify_flow.py`
 

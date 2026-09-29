@@ -277,5 +277,37 @@ class PickCase(unittest.TestCase):
         self.assertEqual(seen["n"], 2)
 
 
+class ExtractAwemeIdTest(unittest.TestCase):
+    """作品 id 抽取。
+
+    ★ 「纯数字 id」是**回归点**：`douyin_video_detail` 会先把入参过一遍
+    `extract_aweme_id`（容错"模型把整条链接塞进 aweme_id"），而兜底那条正则
+    `\\d{15,25}` 没有分组，写成 `group(1)` 会抛 `IndexError: no such group`
+    —— 2026-09-29 真机验收就是在这里挂的（搜索通过、详情内部错误）。
+    """
+
+    def test_纯数字id不再抛异常(self):
+        self.assertEqual(
+            douyin_web.extract_aweme_id("7664911070490126501"), "7664911070490126501"
+        )
+
+    def test_各种链接形态都能抽出id(self):
+        cases = {
+            "https://www.douyin.com/video/7664911070490126501": "7664911070490126501",
+            "https://www.douyin.com/discover?modal_id=7664911070490126501": "7664911070490126501",
+            "https://www.douyin.com/user/MS4wLjABAAAA/7664911070490126501": "7664911070490126501",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(douyin_web.extract_aweme_id(text), expected, text)
+
+    def test_抽不到时返回空串而不是抛异常(self):
+        for text in ("没有 id 的文本", "", "1234"):
+            self.assertEqual(douyin_web.extract_aweme_id(text), "", text)
+
+    def test_分享短链与id混在一段话里(self):
+        text = "7.65 复制打开抖音 https://v.douyin.com/iRabcdEf/ 看这个 7664911070490126501"
+        self.assertEqual(douyin_web.extract_aweme_id(text), "7664911070490126501")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

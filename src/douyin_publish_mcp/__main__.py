@@ -40,11 +40,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTTP 鉴权 token（留空则读 AUTH_TOKEN 环境变量；绑定非本机地址时必填）",
     )
     p.add_argument("--version", action="version", version="%s %s" % (SERVER_NAME, __version__))
+    # ★ 隐藏入口：浏览器通道的宿主就是本程序自己（`douyin-publish-mcp.exe --browser-helper <spec>`）。
+    #   这样 exe 里不用放浏览器驱动（patchright 那 ~90MB），驱动按需取、挂在子进程的 PYTHONPATH 上。
+    #   刻意不写进 --help：它不是给用户敲的，是 douyin_browser.py 拉起的内部约定。
+    p.add_argument("--browser-helper", metavar="SPEC", default="", help=argparse.SUPPRESS)
     return p
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.browser_helper:
+        from .browser_helper import main as helper_main
+
+        return helper_main([args.browser_helper])
     cfg = SauConfig.from_env()
     if args.http:
         import os

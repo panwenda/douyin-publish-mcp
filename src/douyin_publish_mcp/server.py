@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import __version__, sau
+from . import douyin_browser as browser
 from .douyin_cred import default_account, resolve_credential
 from .douyin_web import (
     DouyinWebClient,
@@ -658,8 +659,18 @@ def _publish_tool(cfg: SauConfig, args: Dict[str, Any], kind: str) -> Dict[str, 
 
 
 def _read_client(cfg: SauConfig, args: Dict[str, Any]) -> DouyinWebClient:
+    return _read_ctx(cfg, args)[0]
+
+
+def _read_ctx(cfg: SauConfig, args: Dict[str, Any]):
+    """一次读取的上下文：直连客户端 + 凭据 + 浏览器通道参数。
+
+    ★ 三样东西必须一起拿：凭据是两条通道共用的（浏览器那份 storage_state 也来自它），
+      而浏览器参数每次从环境读（`DOUYIN_BROWSER=off` 之类改了立刻生效，不用重启服务）。
+    """
     account = _opt_str(args, "account")
-    return DouyinWebClient(resolve_credential(cfg, account), WebConfig())
+    cred = resolve_credential(cfg, account)
+    return DouyinWebClient(cred, WebConfig()), cred, browser.BrowserConfig.from_env()
 
 
 def _web_fail(e: DouyinWebError) -> Dict[str, Any]:
@@ -725,6 +736,22 @@ def _render_user(user: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _source_note(user_source: str, videos_source: str) -> str:
+    """把"这次数据是从哪条通道来的"如实写出来（**只在真走了浏览器时**）。
+
+    ★ 直连全是亚秒级，浏览器要起进程、等页面自己发请求（实测 0.4~2 秒，冷启更久）。
+      所以只有回退过才值得说一句 —— 用户看到"这次怎么慢了"时，答案就在这句里；
+      全程直连时保持安静，免得每条输出都拖一条尾巴。
+    """
+    parts = [p for p in (
+        "资料 " + user_source if user_source else "",
+        "作品 " + videos_source if videos_source else "",
+    ) if p]
+    if not parts or all(p.endswith("直连") for p in parts):
+        return ""
+    return "通道：" + "／".join(parts) + "。直连被风控挡住（403）时自动改用浏览器通道，属正常回退。"
+
+
 def tool_search_videos(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     keyword = _require_str(args, "keyword")
     count = _bounded_int(args.get("count"), 10, 1, 20)
@@ -762,13 +789,14 @@ def tool_video_detail(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     # 容错：模型有时会把整条链接塞进 aweme_id
     aweme_id = extract_aweme_id(raw) or raw
     try:
-        client = _read_client(cfg, args)
-        video = client.video_detail(aweme_id)
+        client, cred, browser_cfg = _read_ctx(cfg, args)
+        # ★ 作品详情是被 uifid 墙挡着的那个接口：直连 403 时自动回退浏览器通道
+        read = browser.video_detail(browser_cfg, client, aweme_id, cred, cfg)
     except SauError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
-    return _text(_render_video(1, video) + f"\n\n（{client.sign_note()}）")
+    return _text(_render_video(1, read.data) + f"\n\n（{client.sign_note()}｜本次通道：{read.source}）")
 
 
 def tool_user_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -776,58 +804,59 @@ def tool_user_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     include_videos = bool(args.get("include_videos", True))
     limit = _bounded_int(args.get("limit"), 20, 1, 100)
     try:
-        client = _read_client(cfg, args)
-        user = client.user_profile(sec_user_id)
-        videos = client.user_videos_all(sec_user_id, limit) if include_videos else []
+        client, cred, browser_cfg = _read_ctx(cfg, args)
+        # ★ 资料与作品在同一个页面、同一次导航里 —— 合成一次抓取，别起两遍浏览器
+        page = browser.user_page(browser_cfg, client, sec_user_id, cred, count=limit,
+                                 include_videos=include_videos, sau_cfg=cfg)
     except SauError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
 
-    text = _render_user(user)
+    text = _render_user(page.user)
     if include_videos:
-        text += f"\n\n最近作品（最多 {limit} 条，实际 {len(videos)} 条）：\n\n"
-        text += _render_videos(videos) if videos else "(这个号没有取到作品)"
-    return _text(text)
+        text += f"\n\n最近作品（最多 {limit} 条，实际 {len(page.videos)} 条）：\n\n"
+        text += _render_videos(page.videos) if page.videos else "(这个号没有取到作品)"
+    note = _source_note(page.user_source, page.videos_source if include_videos else "")
+    return _text(text + ("\n\n" + note if note else ""))
 
 
 def tool_my_profile(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     include_videos = bool(args.get("include_videos", True))
     limit = _bounded_int(args.get("limit"), 20, 1, 100)
     try:
-        client = _read_client(cfg, args)
-        user = client.my_profile()
+        client, cred, browser_cfg = _read_ctx(cfg, args)
         # ★ 自己的作品列表走同一个 user_videos 接口：/profile/self/ 只给资料，
         #   而"我发了哪些"是用户最常问的一句，所以这里顺手拉一次。
-        videos = (
-            client.user_videos_all(user["sec_user_id"], limit)
-            if include_videos and user.get("sec_user_id")
-            else []
-        )
+        page = browser.self_page(browser_cfg, client, cred, count=limit,
+                                 include_videos=include_videos, sau_cfg=cfg)
     except SauError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
 
-    text = "当前登录账号：\n\n" + _render_user(user)
+    text = "当前登录账号：\n\n" + _render_user(page.user)
     if include_videos:
-        text += f"\n\n最近作品（最多 {limit} 条，实际 {len(videos)} 条）：\n\n"
-        text += _render_videos(videos) if videos else "(没有取到作品)"
-    return _text(text)
+        text += f"\n\n最近作品（最多 {limit} 条，实际 {len(page.videos)} 条）：\n\n"
+        text += _render_videos(page.videos) if page.videos else "(没有取到作品)"
+    note = _source_note(page.user_source, page.videos_source if include_videos else "")
+    return _text(text + ("\n\n" + note if note else ""))
 
 
 def tool_parse_share_link(cfg: SauConfig, args: Dict[str, Any]) -> Dict[str, Any]:
     share_text = _require_str(args, "share_text")
     try:
-        client = _read_client(cfg, args)
+        client, cred, browser_cfg = _read_ctx(cfg, args)
         aweme_id = client.resolve_aweme_id(share_text)
-        video = client.video_detail(aweme_id)
+        # 分享链接解析出来的是 id，真正的内容还是走详情接口 —— 同样要能回退浏览器
+        read = browser.video_detail(browser_cfg, client, aweme_id, cred, cfg)
     except SauError as e:
         return _text(f"读取失败：{e}", True)
     except DouyinWebError as e:
         return _web_fail(e)
     return _text(
-        f"从分享内容里解析到作品 {aweme_id}：\n\n" + _render_video(1, video) + f"\n\n（{client.sign_note()}）"
+        f"从分享内容里解析到作品 {aweme_id}：\n\n" + _render_video(1, read.data)
+        + f"\n\n（{client.sign_note()}｜本次通道：{read.source}）"
     )
 
 

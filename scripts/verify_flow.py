@@ -10,7 +10,8 @@
 | 发布门禁 | ✅ 预检 + 两条拦截（**一行 CLI 都不跑**） | |
 | HTTP 形态 | ✅ 真起服务、真发请求、真验鉴权 | |
 | 登录态 | | ✅ `sau douyin check` |
-| 读取五连 | | ✅ 搜索 / 详情 / 主页 / 分享（会真调抖音接口） |
+| 读取五连 | | ✅ 搜索 / 详情 / 主页 / 分享（会真调抖音接口，并标明走的哪条通道） |
+| 浏览器通道 | | ✅ 详情 + 评论（**单独验**：它平时是"被回退才出场"，只靠工具 PASS 会漏掉它坏了） |
 
 本地段全绿只说明"这个服务的壳是对的"，**不说明抖音认它**。所以脚本最后会把
 "还没验过的"单独列出来 —— SKIP 从来不算通过。
@@ -40,6 +41,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -51,6 +53,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from douyin_publish_mcp.douyin_cred import default_account, resolve_credential  # noqa: E402
+from douyin_publish_mcp.douyin_web import DouyinWebClient, DouyinWebError, WebConfig  # noqa: E402
 from douyin_publish_mcp.http_server import App, make_handler  # noqa: E402
 from douyin_publish_mcp.sau import SauConfig  # noqa: E402
 from douyin_publish_mcp.server import TOOLS, Server  # noqa: E402
@@ -64,13 +67,28 @@ RESULTS = []  # (状态, 环节, 说明)
 # ── 输出 ────────────────────────────────────────────────────
 
 
+def _console_safe(text: str) -> str:
+    """把控制台编码塞不下的字符换成 `?`。
+
+    ★ 实测踩到：作品标题里带 emoji（🏠）时，Windows 控制台是 GBK，
+      `print` 直接抛 UnicodeEncodeError —— 一条验收结果没打出来，脚本先崩了。
+      验收脚本的职责是"如实报告"，不该被被测数据里的一个字符放倒。
+    """
+    enc = getattr(sys.stdout, "encoding", "") or "utf-8"
+    try:
+        text.encode(enc)
+        return text
+    except (UnicodeEncodeError, LookupError):
+        return text.encode(enc, errors="replace").decode(enc, errors="replace")
+
+
 def record(status: str, name: str, detail: str = "") -> None:
     RESULTS.append((status, name, detail))
     mark = {PASS: "[PASS]", FAIL: "[FAIL]", SKIP: "[SKIP]"}[status]
     line = f"{mark} {name}"
     if detail:
         line += f"\n       {detail.replace(chr(10), chr(10) + '       ')}"
-    print(line, flush=True)
+    print(_console_safe(line), flush=True)
 
 
 def banner(text: str) -> None:
@@ -108,6 +126,20 @@ def is_error(result: dict) -> bool:
 def _first(pattern: str, text: str) -> str:
     m = re.search(pattern, text or "")
     return m.group(1) if m else ""
+
+
+def _channel_of(text: str) -> str:
+    """从工具输出里读出"这次走的是哪条通道"。
+
+    ★ 读取工具在回退过浏览器时会附一句「本次通道：…」。验收要能区分
+      "直连干的"和"浏览器救回来的" —— 否则平台哪天把直连放开/收紧，
+      我们看 PASS 也看不出发生了什么。
+    """
+    m = re.search(r"本次通道：([^）\n]+)", text or "")
+    if m:
+        return "通道=" + m.group(1).strip()
+    m = re.search(r"通道：([^\n]+)", text or "")   # 主页那两件事合并输出时的形态
+    return "通道=" + m.group(1).strip() if m else ""
 
 
 # ── 本地段 ──────────────────────────────────────────────────
@@ -388,23 +420,26 @@ def step_login(server: Server, account: str) -> bool:
     return False
 
 
-def step_read(server: Server, account: str, keyword: str) -> None:
-    """读取五连：搜索 → 详情 → 用户主页 → 我的主页 → 分享解析（真实 id 串起来）。"""
+def step_read(server: Server, account: str, keyword: str) -> str:
+    """读取五连：搜索 → 详情 → 用户主页 → 我的主页 → 分享解析（真实 id 串起来）。
+
+    返回搜到的那条 aweme_id（供后面的浏览器通道步骤复用；没搜到就是空串）。
+    """
     result, err = call(server, "douyin_search_videos", {"keyword": keyword, "count": 5, "account": account})
     if err:
         record(FAIL, f"真机：搜索「{keyword}」", err)
-        return
+        return ""
     text = text_of(result)
     if is_error(result):
         record(FAIL, f"真机：搜索「{keyword}」", "工具回的是错误（不是空结果）——这正是最该看的失败：\n" + text[:600])
-        return
+        return ""
     if "搜到 0 条" in text:
         record(
             SKIP,
             f"真机：搜索「{keyword}」",
             "返回 0 条（不算错误但不正常）：换个更宽的关键词、publish_time 放宽到 all 再试",
         )
-        return
+        return ""
 
     aweme_id = _first(r"aweme_id：(\d{15,25})", text)
     sec_user_id = _first(r"sec_user_id：(MS4w[A-Za-z0-9_-]+)", text)
@@ -417,7 +452,7 @@ def step_read(server: Server, account: str, keyword: str) -> None:
         if err or is_error(result):
             record(FAIL, "真机：作品详情", (err or text)[:600])
         elif "无水印直链" in text:
-            record(PASS, "真机：作品详情", "拿到详情与无水印直链")
+            record(PASS, "真机：作品详情", f"拿到详情与无水印直链（{_channel_of(text)}）")
         else:
             record(SKIP, "真机：作品详情", "有返回但没有直链字段：\n" + text[:400])
 
@@ -427,7 +462,7 @@ def step_read(server: Server, account: str, keyword: str) -> None:
         if err or is_error(result):
             record(FAIL, "真机：分享链接解析", (err or text)[:600])
         elif aweme_id in text:
-            record(PASS, "真机：分享链接解析", "从分享文本里解出作品并读到详情")
+            record(PASS, "真机：分享链接解析", f"从分享文本里解出作品并读到详情（{_channel_of(text)}）")
         else:
             record(FAIL, "真机：分享链接解析", "解析结果里没有那条作品：\n" + text[:400])
 
@@ -437,7 +472,7 @@ def step_read(server: Server, account: str, keyword: str) -> None:
         if err or is_error(result):
             record(FAIL, "真机：用户主页", (err or text)[:600])
         elif "粉丝" in text:
-            record(PASS, "真机：用户主页", "拿到资料与最近作品")
+            record(PASS, "真机：用户主页", "拿到资料与最近作品" + (f"（{_channel_of(text)}）" if _channel_of(text) else ""))
         else:
             record(FAIL, "真机：用户主页", "返回里没有资料字段：\n" + text[:400])
     else:
@@ -448,9 +483,86 @@ def step_read(server: Server, account: str, keyword: str) -> None:
     if err or is_error(result):
         record(FAIL, "真机：我的主页", (err or text)[:600])
     elif "当前登录账号" in text:
-        record(PASS, "真机：我的主页", "读到当前账号资料")
+        record(PASS, "真机：我的主页", "读到当前账号资料" + (f"（{_channel_of(text)}）" if _channel_of(text) else ""))
     else:
         record(FAIL, "真机：我的主页", "返回里没有账号资料：\n" + text[:400])
+    return aweme_id
+
+
+def step_browser_channel(cfg: SauConfig, account: str, aweme_id: str) -> None:
+    """浏览器通道单独验一遍：**别只看那四个工具"过了"**。
+
+    ★ 为什么必须单独验（这是它唯一会被漏掉的方式）：
+      作品详情/用户作品在直连被风控挡住时会自动回退，于是"工具 PASS"其实常常是
+      浏览器通道在干活 —— 可反过来，哪天直连被放开，工具照样 PASS，而浏览器通道
+      坏掉了没人知道（它只是不再参与）。这一步直接调通道本身，顺便说清
+      "这一轮到底是直连在干活还是浏览器在救"，以及**评论**（只有浏览器通道有）。
+
+    取驱动/浏览器的路数都在这一步的失败说明里（`no_driver` → 报"驱动没就位"而不是
+    "通道坏了"：环境没备好与功能失效要分开说）。
+    """
+    from douyin_publish_mcp import douyin_browser as browser  # 局部导入：--local-only 时不碰
+
+    bcfg = browser.BrowserConfig.from_env()
+    if not bcfg.enabled:
+        record(SKIP, "真机：浏览器通道", "已被 DOUYIN_BROWSER=off 关闭（只留直连通道）")
+        return
+    if not aweme_id:
+        record(SKIP, "真机：浏览器通道", "没拿到 aweme_id（先让搜索那一步过）")
+        return
+    try:
+        cred = resolve_credential(cfg, account)
+    except Exception as e:  # noqa: BLE001
+        record(FAIL, "真机：浏览器通道", f"定位凭据失败：{e}")
+        return
+    if not cred.usable:
+        record(SKIP, "真机：浏览器通道", "没有可用凭据（还没扫码登录）")
+        return
+
+    note = browser.describe(bcfg, cfg)
+    started = time.time()
+    try:
+        payload = browser.read(
+            bcfg, cred,
+            # 作品详情 + 评论：两个都在同一个视频页上，一次导航抓全
+            [{"kind": "video_detail", "aweme_id": aweme_id},
+             {"kind": "comments", "aweme_id": aweme_id}],
+            cfg,
+        )
+    except DouyinWebError as e:
+        record(FAIL, "真机：浏览器通道", f"{e.describe()}\n{note}")
+        return
+    elapsed_ms = int((time.time() - started) * 1000)
+
+    if not payload.get("ok"):
+        err = payload.get("error") or {}
+        kind = str(err.get("kind") or "unknown")
+        detail = "\n".join(x for x in (err.get("message", ""), err.get("hint", ""), note) if x)
+        # ★ 缺驱动/缺浏览器 = 环境没备好（SKIP + 怎么备），其它才是通道真的失效（FAIL）
+        record(SKIP if kind in ("no_driver", "no_browser") else FAIL, "真机：浏览器通道", detail[:800])
+        return
+
+    results = payload.get("results") or {}
+    detail = ((results.get("video_detail:%s" % aweme_id) or {}).get("body") or {}).get("aweme_detail") or {}
+    urls = ((detail.get("video") or {}).get("play_addr") or {}).get("url_list") or []
+    comments = ((results.get("comments:%s" % aweme_id) or {}).get("body") or {}).get("comments") or []
+    if not detail or not urls:
+        record(FAIL, "真机：浏览器通道", "抓到了响应但详情里没有可用字段（接口可能改版）\n" + note)
+        return
+
+    direct = "直连：未知"
+    try:
+        DouyinWebClient(cred, WebConfig()).video_detail(aweme_id)
+        direct = "直连：现在也通（回退仍可用，只是这一轮没被用到）"
+    except DouyinWebError as e:
+        direct = f"直连：{e.kind}（所以详情/用户作品这几步是浏览器救回来的）"
+
+    record(
+        PASS,
+        "真机：浏览器通道",
+        f"{payload.get('browser')}｜{elapsed_ms}ms｜详情 {str(detail.get('desc') or '')[:16]!r}"
+        f"｜无水印直链 {len(urls)} 个｜评论 {len(comments)} 条\n· {direct}\n· {note}",
+    )
 
 
 def step_publish_real(cfg: SauConfig, account: str, media_file: str, title: str, confirm_publish: bool) -> None:
@@ -515,31 +627,39 @@ def main(argv=None) -> int:
 
     if not args.local_only:
         server = Server(cfg)
-        banner("5/7 真机：环境前置")
+        banner("5/8 真机：环境前置")
         env_ok = step_env(cfg, account)
-        banner("6/7 真机：登录态与读取")
+        banner("6/8 真机：登录态与读取")
         login_ok = step_login(server, account) if env_ok else _skip("真机：登录态", "环境前置没过，跳过")
+        aweme_id = ""
         if env_ok and login_ok:
-            step_read(server, account, args.keyword)
+            aweme_id = step_read(server, account, args.keyword)
         else:
             _skip("真机：读取五连", "需要「环境就绪 + 已登录」；补上后再跑本脚本")
+        banner("7/8 真机：浏览器通道")
+        if env_ok and login_ok:
+            step_browser_channel(cfg, account, aweme_id)
+        else:
+            _skip("真机：浏览器通道", "需要「环境就绪 + 已登录」；补上后再跑本脚本")
+        banner("8/8 真机：发布")
         step_publish_real(cfg, account, args.publish_file, args.publish_title, args.confirm_publish)
     else:
-        for name in ("真机：环境前置", "真机：登录态", "真机：读取五连", "真机：发布"):
+        for name in ("真机：环境前置", "真机：登录态", "真机：读取五连",
+                     "真机：浏览器通道", "真机：发布"):
             _skip(name, "本次是 --local-only；这些需要 sau 与登录态，本地验不了")
 
-    banner("汇总" if args.local_only else "7/7 汇总")
+    banner("汇总" if args.local_only else "8/8 汇总")
     fails = [r for r in RESULTS if r[0] == FAIL]
     skips = [r for r in RESULTS if r[0] == SKIP]
     passes = [r for r in RESULTS if r[0] == PASS]
     print(f"PASS {len(passes)}｜FAIL {len(fails)}｜SKIP {len(skips)}")
     for status, name, detail in RESULTS:
         if status == FAIL:
-            print(f"  [FAIL] {name}：{detail.splitlines()[0] if detail else ''}")
+            print(_console_safe(f"  [FAIL] {name}：{detail.splitlines()[0] if detail else ''}"))
     if skips:
         print("跳过项（**不是通过**）：")
         for _, name, detail in skips:
-            print(f"  [SKIP] {name}：{detail.splitlines()[0] if detail else ''}")
+            print(_console_safe(f"  [SKIP] {name}：{detail.splitlines()[0] if detail else ''}"))
     print()
     if fails:
         print("本地段已通过的部分是真的通过了；FAIL 项按上面的说明修，再重跑本脚本。")

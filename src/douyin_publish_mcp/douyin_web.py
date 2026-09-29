@@ -383,13 +383,9 @@ class DouyinWebClient:
                 kind="upstream",
                 hint="作品可能已被删除/设为私密，或 aweme_id 不对（分享链接里的那一长串数字才是）。",
             )
-        picked = pick_video(aweme, with_stats=True)
+        picked = video_from_aweme(aweme)
         if not picked:
             raise DouyinWebError("作品详情里没有可用的视频信息", kind="parse", hint="接口结构可能已变。")
-        picked["comments_count"] = _dig(aweme, "statistics", "comment_count", default=0)
-        picked["share_count"] = _dig(aweme, "statistics", "share_count", default=0)
-        picked["collect_count"] = _dig(aweme, "statistics", "collect_count", default=0)
-        picked["music"] = _dig(aweme, "music", "title", default="")
         return picked
 
     def user_profile(self, sec_user_id: str) -> Dict[str, Any]:
@@ -410,13 +406,7 @@ class DouyinWebClient:
             PATH_USER_POST,
             {"sec_user_id": str(sec_user_id), "max_cursor": max_cursor, "count": count},
         )
-        items = data.get("aweme_list") or []
-        videos = [v for v in (pick_video(i) for i in items if isinstance(i, dict)) if v]
-        return {
-            "videos": videos,
-            "has_more": int(_dig(data, "has_more", default=0) or 0) == 1,
-            "max_cursor": int(_dig(data, "max_cursor", default=0) or 0),
-        }
+        return user_page_from_post(data)
 
     def user_videos_all(self, sec_user_id: str, limit: int = 60) -> List[Dict[str, Any]]:
         """自动翻页，最多取 `limit` 条。
@@ -539,13 +529,18 @@ def extract_share_url(text: str) -> str:
 
 
 def extract_aweme_id(text: str) -> str:
-    """从 URL 或纯文本里抽作品 id（抽不到返回空串）。"""
+    """从 URL 或纯文本里抽作品 id（抽不到返回空串）。
+
+    ★ 兜底那条正则**没有分组**，必须取 `group(0)`：写成 `group(1)` 会在"纯数字 id"
+    （模型直接把上一轮拿到的 aweme_id 塞回来，这是最常见的一种）上抛
+    `IndexError: no such group` —— 2026-09-29 真机验收就是这么挂的。
+    """
     for pattern in (r"/video/(\d{15,25})", r"modal_id=(\d{15,25})", r"/(\d{15,25})"):
         m = re.search(pattern, text or "")
         if m:
             return m.group(1)
     m = _AWEME_ID_RE.search(text or "")
-    return m.group(1) if m else ""
+    return m.group(0) if m else ""
 
 
 # ── DTO 裁剪 ────────────────────────────────────────────────
@@ -610,6 +605,34 @@ def pick_user(user: Any) -> Dict[str, Any]:
     }
 
 
+def video_from_aweme(aweme: Any) -> Dict[str, Any]:
+    """作品原始对象 → 对外 DTO（**直连与浏览器通道共用**）。
+
+    ★ 两条通道必须给出同一形状：模型看到的是同一批字段，才不会因为
+      "这次多了音乐名、下次没有"而写出不一样的回答。
+    """
+    picked = pick_video(aweme, with_stats=True)
+    if not picked:
+        return {}
+    picked["comments_count"] = _dig(aweme, "statistics", "comment_count", default=0)
+    picked["share_count"] = _dig(aweme, "statistics", "share_count", default=0)
+    picked["collect_count"] = _dig(aweme, "statistics", "collect_count", default=0)
+    picked["music"] = _dig(aweme, "music", "title", default="")
+    return picked
+
+
+def user_page_from_post(data: Any) -> Dict[str, Any]:
+    """`/aweme/v1/web/aweme/post/` 的响应 → 一页作品（同样两条通道共用）。"""
+    body = data if isinstance(data, dict) else {}
+    items = body.get("aweme_list") or []
+    videos = [v for v in (pick_video(i) for i in items if isinstance(i, dict)) if v]
+    return {
+        "videos": videos,
+        "has_more": int(_dig(body, "has_more", default=0) or 0) == 1,
+        "max_cursor": int(_dig(body, "max_cursor", default=0) or 0),
+    }
+
+
 __all__ = [
     "DouyinWebClient",
     "DouyinWebError",
@@ -623,6 +646,8 @@ __all__ = [
     "PATH_MY_PROFILE",
     "pick_video",
     "pick_user",
+    "video_from_aweme",
+    "user_page_from_post",
     "extract_share_url",
     "extract_aweme_id",
 ]
