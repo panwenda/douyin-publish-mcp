@@ -1,7 +1,9 @@
 """发布页上的那些"点不动/挡住了/要等"的步骤 —— 移植自参考实现的真机经验。
 
 这些函数看着啰嗦，但每一行都对应一个真实踩过的坑（模块内就地注明）。
-它们只依赖 patchright 的 Page，不依赖本服务的其它模块，便于单测里用假 page 顶替。
+它们只依赖 patchright 的 Page 与 `creator.CreatorError`（**那个异常类型必须共用**：
+  `creator_publish._publish` 是按 `except CreatorError` 分支处理的，这里另造一个
+  异常类就会漏成"意外错误"），便于单测里用假 page 顶替。
 
 参考来源：social-auto-upload（MIT）的 `uploader/douyin_uploader/main.py`，
 见 NOTICE 的署名。
@@ -14,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+
+from .creator import CreatorError
 
 #: 抖音自定义组件对普通 click 常常"既不抛异常也不生效"，必须派发完整原生事件序列
 _NATIVE_CLICK_JS = """({x, y}) => {
@@ -92,15 +96,51 @@ async def clear_blocking_overlays(page) -> None:
     await page.wait_for_timeout(400)
 
 
+#: 标题输入框的候选选择器。★ **两个页面的 placeholder 不一样，别只写一个**：
+#:   · 视频发布页 = 「填写作品标题」
+#:   · 图文发布页 = 「添加作品标题」（实测 2026-10-08，post/image 页）
+#:   只认前者时，图文发布会在「等标题框 visible」上卡到 120 秒超时才报错 ——
+#:   而那时图片已经传完了，用户白等一场。
+_TITLE_INPUT_SELECTORS = (
+    'input[placeholder*="作品标题"]',   # 同时覆盖「填写作品标题」与「添加作品标题」
+    'input[placeholder*="标题"]',
+    'input.semi-input[type="text"]',
+)
+
+
+async def _find_title_input(page, timeout_ms: int = 120000):
+    """等标题输入框出现，返回第一个命中的 locator。
+
+    ★ 用"逐个候选 + 轮询"而不是单选择器 wait_for：页面切换时两种 placeholder
+      都可能出现，谁先于超时命中就用谁；全程没命中才抛 CreatorError（带可选值提示）。
+    """
+    started = asyncio.get_event_loop().time()
+    while True:
+        for selector in _TITLE_INPUT_SELECTORS:
+            node = page.locator(selector).first
+            try:
+                if await node.count():
+                    await node.wait_for(state="visible", timeout=5000)
+                    return node
+            except Exception:  # noqa: BLE001 —— 页面重渲染时探测失败是常态
+                continue
+        if (asyncio.get_event_loop().time() - started) * 1000 > timeout_ms:
+            raise CreatorError(
+                "等了 %d 秒没找到标题输入框（候选：%s）"
+                % (timeout_ms // 1000, " / ".join(_TITLE_INPUT_SELECTORS))
+            )
+        await page.wait_for_timeout(400)
+
+
 async def fill_title_and_description(page, title: str, description: str, tags: Sequence[str]) -> None:
     """标题 + 正文 + 话题。
 
-    ★ 标题输入框要等到**视频传完**才渲染（实测约 40 秒，大文件更久），所以等待给到 120 秒。
+    ★ 标题输入框要等到**素材传完**才渲染（视频实测约 40 秒，大文件更久），所以等待给到 120 秒。
+    ★ 视频页与图文页的 placeholder **不同**（填写/添加作品标题），故走多选择器兜底，见上。
     ★ 正文是 contenteditable 的富文本容器，不是 textarea：先清空再逐字打，
       话题按 " #tag + 空格" 触发下拉，最后按 Escape 收起下拉 —— 否则浮层会挡住后面的点击。
     """
-    title_input = page.locator('input[placeholder*="填写作品标题"]').first
-    await title_input.wait_for(state="visible", timeout=120000)
+    title_input = await _find_title_input(page, timeout_ms=120000)
     await title_input.fill(str(title)[:30])
 
     editor = page.locator('div.zone-container[contenteditable="true"]').first

@@ -153,7 +153,7 @@ TOOLS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "account": {"type": "string", "description": "账号名"},
-                "file": {"type": "string", "description": "视频文件路径（必须在素材目录内，可用相对路径）"},
+                "file": {"type": "string", "description": "视频文件路径（配了素材目录则必须在它里面，可用相对路径）"},
                 "title": {"type": "string", "description": "作品标题（≤30 字，单行）"},
                 "description": {"type": "string", "description": "正文/描述（可选）"},
                 "tags": {
@@ -167,11 +167,11 @@ TOOLS: List[Dict[str, Any]] = [
                 },
                 "thumbnail_portrait": {
                     "type": "string",
-                    "description": "竖版封面 3:4（可选，素材目录内的路径）。与 landscape 可同时给。",
+                    "description": "竖版封面 3:4（可选；配了素材目录则为其中的路径）。与 landscape 可同时给。",
                 },
                 "thumbnail_landscape": {
                     "type": "string",
-                    "description": "横版封面 4:3（可选，素材目录内的路径）。",
+                    "description": "横版封面 4:3（可选；配了素材目录则为其中的路径）。",
                 },
                 "product_link": {
                     "type": "string",
@@ -203,13 +203,13 @@ TOOLS: List[Dict[str, Any]] = [
                 "images": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "图片路径列表（必须在素材目录内），抖音最多 35 张、不支持 GIF",
+                    "description": "图片路径列表（配了素材目录则必须在它里面），抖音最多 35 张、不支持 GIF",
                 },
                 "title": {"type": "string", "description": "图文标题（≤30 字，单行）"},
                 "note": {"type": "string", "description": "图文正文（可选）。与 note_file 只能给一个。"},
                 "note_file": {
                     "type": "string",
-                    "description": "把正文放在文件里（可选，素材目录内的 .txt/.md 路径）。长正文建议用这个。",
+                    "description": "把正文放在文件里（可选；配了素材目录则为其中的 .txt/.md 路径）。长正文建议用这个。",
                 },
                 "bgm": {"type": "string", "description": "背景音乐**搜索词**（可选），如「轻快 纯音乐」；不是文件路径。"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "话题标签（可选）"},
@@ -1051,7 +1051,7 @@ def _manual_login_hint(cfg: RuntimeConfig, account: str) -> str:
 def main() -> int:
     cfg = RuntimeConfig.from_env()
     print(
-        f"[{SERVER_NAME}] 就绪：素材目录={cfg.media_dir or '(未设置)'} "
+        f"[{SERVER_NAME}] 就绪：素材目录={cfg.media_dir or '(未设置=不限制)'} "
         f"账号={cfg.account} 超时={cfg.timeout}s",
         file=sys.stderr,
         flush=True,

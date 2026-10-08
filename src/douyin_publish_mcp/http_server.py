@@ -171,7 +171,7 @@ class App:
         rows = [
             ("MCP 端点", mcp_url),
             ("鉴权", auth_note),
-            ("素材目录 (DOUYIN_MEDIA_DIR)", cfg.media_dir or "（未设置，发布会被拒绝）"),
+            ("素材目录 (DOUYIN_MEDIA_DIR)", cfg.media_dir or "（未设置 = 不限制目录，任何文件都可发布）"),
             ("默认账号 (DOUYIN_ACCOUNT)", cfg.account),
             ("发布用无头 (DOUYIN_PUBLISH_HEADLESS)", "是" if cfg.headless else "否"),
             ("浏览器通道 (DOUYIN_CREATOR_CHANNEL)", cfg.channel),

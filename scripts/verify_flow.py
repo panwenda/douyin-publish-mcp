@@ -391,15 +391,13 @@ def step_env(cfg: RuntimeConfig, account: str) -> bool:
     """环境前置：只看"发布/读取需要的东西在不在"，**不发任何网络请求**。
 
     ★ v0.3.0 起不再检查 `sau`（那套 CLI 已经不用了），改成三件事：
-      ① 素材目录配了并在（发布闸门，没配就拒绝发布）；
+      ① 素材目录**如果配了**就要在（可选的发布白名单，没配=不限制目录）；
       ② 有一份能用的登录态（读取与发布共用）；
       ③ 浏览器通道的驱动就位（读取的详情/评论靠它兜底）。
     """
     problems = []
-    if not cfg.media_dir:
-        problems.append("DOUYIN_MEDIA_DIR 没配：发布工具会拒绝执行（读取不受影响）")
-    elif not Path(cfg.media_dir).is_dir():
-        problems.append(f"素材目录不存在：{cfg.media_dir}")
+    if cfg.media_dir and not Path(cfg.media_dir).is_dir():
+        problems.append(f"素材目录不存在：{cfg.media_dir}（DOUYIN_MEDIA_DIR 配了就得真实存在）")
     if problems:
         record(FAIL, "真机：环境前置", "\n".join("· " + p for p in problems))
         return False

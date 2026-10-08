@@ -110,7 +110,7 @@ def main(argv=None) -> int:
     # stdio：与既有商店配置完全一致的行为
     sys.stderr.write(
         "[%s] stdio 就绪：素材目录=%s 账号=%s 超时=%ss\n"
-        % (SERVER_NAME, cfg.media_dir or "(未设置，发布会被拒绝)", cfg.account, cfg.timeout)
+        % (SERVER_NAME, cfg.media_dir or "(未设置=不限制)", cfg.account, cfg.timeout)
     )
     sys.stderr.flush()
     Server(cfg).serve()

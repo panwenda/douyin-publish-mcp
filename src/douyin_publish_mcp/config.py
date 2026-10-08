@@ -6,11 +6,18 @@ v0.3.0 起本服务自带创作者中心自动化（登录 / 发布 / 账号检�
 不再调用外部 CLI，因此那套 `SAU_CMD` / `SAU_DIR` / `SAU_UV` / `SAU_NO_SYNC` 全部作废。
 环境变量统一到 `DOUYIN_` 前缀 —— 一个服务一个前缀，看名字就知道该配哪儿。
 
-## 保留的那条硬约束
+## 可选的路径白名单
 
-`DOUYIN_MEDIA_DIR` 是**允许发布的素材根目录**，也是本服务唯一的路径闸门：
-发布工具的每一个文件路径都必须落在它里面。缺了它就**拒绝发布**（而不是退化成
-"整个磁盘可读"）—— 宁可报"没配置"，也不能让模型顺着路径参数把任意文件发出去。
+`DOUYIN_MEDIA_DIR` 是**可选的**素材根目录白名单：
+
+* **配了**（且目录存在）→ 当作硬边界：发布工具的每个文件路径都必须落在它里面；
+* **没配** → 不限制目录，任何可读文件都能发布（只校验"文件存在、是文件"）。
+
+★ 为什么改成可选：闸门的初衷是防止模型顺着路径参数把任意文件发出去，但**代价是
+  每台机器都必须先猜一个目录名填进去**，否则连"发一张图"都做不到 —— 装完不能用的
+  门槛太高。现在的取舍是：默认不挡（可用优先），需要收窄时再填这个变量。
+
+相对路径仍然按素材目录解析（配了的话）；没配时按进程当前工作目录解析。
 """
 
 from __future__ import annotations
@@ -75,7 +82,7 @@ def credential_path(account: str = "") -> Path:
 class RuntimeConfig:
     """一次运行需要的前提条件（全部来自环境变量 / 工具参数）。"""
 
-    #: 允许发布的素材根目录（路径闸门，缺省=拒绝发布）
+    #: 允许发布的素材根目录（**可选**白名单；空=不限制目录，只校验文件存在）
     media_dir: str = ""
     #: 登录与发布共用的账号名（凭据文件名里用它）
     account: str = "main"
@@ -119,41 +126,48 @@ class RuntimeConfig:
             debug=b("DOUYIN_DEBUG", False),
         )
 
-    # ── 路径闸门 ────────────────────────────────────────────
-    def media_root(self) -> Path:
-        """素材根目录；没配就报错（而不是放行）。"""
+    # ── 路径白名单（可选）────────────────────────────────────
+    def media_root(self) -> Optional[Path]:
+        """素材根目录；**没配就返回 None**（表示不限制目录）。
+
+        配了但目录不存在时仍然报错 —— 那多半是笔误（盘符写错、目录被删），
+        静默放行会让人以为"白名单生效了"。
+        """
         if not self.media_dir:
-            raise ConfigError(
-                "未配置素材目录（DOUYIN_MEDIA_DIR）。请到「MCP 配置」里填上**允许发布的素材根目录**"
-                "（例如 D:\\\\douyin-media），发布工具的每个文件都必须落在它里面。"
-            )
+            return None
         root = Path(self.media_dir).expanduser()
         if not root.is_dir():
             raise ConfigError(f"素材目录不存在：{root}（请核对 DOUYIN_MEDIA_DIR）")
         return root
 
     def resolve_media_path(self, raw: str) -> Path:
-        """把一个文件参数解析成媒体目录内的真实路径；越界/不存在都在这里拦住。
+        """把一个文件参数解析成真实路径；不存在的文件在这里拦住。
 
-        ★ 相对路径按素材目录解析 —— 这样模型说"用 cover.png"时，指的是素材目录里那张，
-          而不是服务进程的当前工作目录（那是个谁都说不准的地方）。
+        * 配了 `DOUYIN_MEDIA_DIR` → 额外做**越界检查**，目录外的一律拒绝；
+        * 没配 → 不做目录限制，只要求"文件存在"。
+
+        相对路径：配了白名单就按素材目录解析（模型说"用 cover.png"指的是素材目录里那张）；
+        没配就按进程当前工作目录解析。
         """
         text = (raw or "").strip()
         if not text:
             raise ConfigError("文件参数不能为空。")
-        root = self.media_root().resolve()
+        root = self.media_root()
         candidate = Path(text).expanduser()
         if not candidate.is_absolute():
-            candidate = root / candidate
+            candidate = (root if root is not None else Path.cwd()) / candidate
         try:
             target = candidate.resolve()
-        except OSError as exc:  # 路径非法（太长/含非法字符）也算配置问题
+        except OSError as exc:  # 路径非法（太长/含非法字符）
             raise ConfigError(f"路径无法解析：{text}（{exc}）") from None
-        if target != root and root not in target.parents:
-            raise ConfigError(
-                f"拒绝访问素材目录之外的文件：{target}\n"
-                f"只允许 {root} 里的文件（DOUYIN_MEDIA_DIR）。要发别的目录请先移进去。"
-            )
+        if root is not None:
+            root = root.resolve()
+            if target != root and root not in target.parents:
+                raise ConfigError(
+                    f"拒绝访问素材目录之外的文件：{target}\n"
+                    f"只允许 {root} 里的文件（DOUYIN_MEDIA_DIR）。"
+                    f"要发别的目录请先移进去，或清空这个变量以取消限制。"
+                )
         if not target.is_file():
             raise ConfigError(f"文件不存在：{target}")
         return target

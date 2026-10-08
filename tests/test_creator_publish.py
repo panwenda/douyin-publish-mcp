@@ -27,7 +27,7 @@ class ArgsCase(unittest.TestCase):
 
 
 class TestMediaGate(ArgsCase):
-    """素材目录是唯一的路径闸门：越界、缺配置、不存在都要拦住。"""
+    """素材目录是**可选**白名单：配了才拦越界，没配就放行（只校验文件存在）。"""
 
     def test_相对路径按素材目录解析(self):
         self.assertEqual(self.cfg.resolve_media_path("a.mp4"), (self.root / "a.mp4").resolve())
@@ -40,11 +40,28 @@ class TestMediaGate(ArgsCase):
             self.cfg.resolve_media_path(str(outside))
         self.assertIn("素材目录之外", str(ctx.exception))
 
-    def test_没配素材目录时拒绝发布(self):
+    def test_没配素材目录时不限制目录(self):
+        """★ 默认不挡：没配白名单时，目录外的文件也能发布（可用优先）。"""
+        outside = self.root.parent / "outside-any.mp4"
+        outside.write_bytes(b"x")
+        self.addCleanup(outside.unlink)
+        cfg = RuntimeConfig(media_dir="")
+        self.assertIsNone(cfg.media_root())
+        self.assertEqual(cfg.resolve_media_path(str(outside)), outside.resolve())
+
+    def test_没配素材目录时仍然拦不存在的文件(self):
+        """放开目录限制 ≠ 不校验：文件本身不存在还是要报错。"""
         cfg = RuntimeConfig(media_dir="")
         with self.assertRaises(ConfigError) as ctx:
+            cfg.resolve_media_path(str(self.root / "nope.mp4"))
+        self.assertIn("文件不存在", str(ctx.exception))
+
+    def test_配了但目录不存在要报错(self):
+        """配了却指错地方（盘符写错/目录被删）不能静默放行。"""
+        cfg = RuntimeConfig(media_dir=str(self.root / "no-such-dir"))
+        with self.assertRaises(ConfigError) as ctx:
             cfg.media_root()
-        self.assertIn("DOUYIN_MEDIA_DIR", str(ctx.exception))
+        self.assertIn("素材目录不存在", str(ctx.exception))
 
     def test_文件不存在被拒(self):
         with self.assertRaises(ConfigError):
@@ -294,6 +311,110 @@ class CreatorHelperDriverPathTest(unittest.TestCase):
                 self.assertIn(tmp, sys.path)
             finally:
                 sys.path[:] = before
+
+
+class TestTitleInputSelectors(unittest.TestCase):
+    """★ 标题输入框必须能同时在**视频页**和**图文页**命中。
+
+    回归来源（真实缺陷，2026-10-08 真机）：`fill_title_and_description` 原先写死
+    `input[placeholder*="填写作品标题"]` —— 那是**视频**发布页的 placeholder。
+    图文发布页（`post/image`）的标题框是「**添加**作品标题」，于是：
+    图片全部传完 → 等标题框 visible → **卡满 120 秒** → 抛 `TimeoutError`。
+    用户看到的是一句"等待标题输入框超时（120秒）"，而它其实只是**选择器写窄了**。
+
+    这里用假 page 断言候选选择器**覆盖两种 placeholder**，并且 `_find_title_input`
+    能在第一个候选落空时继续试后面的。
+    """
+
+    def _fake_page(self, present: dict):
+        """present: 选择器 -> 命中数量。返回一个假 page。"""
+        from douyin_publish_mcp import creator_steps as cs
+
+        calls = []
+
+        class FakeLoc:
+            def __init__(self, sel):
+                self.sel = sel
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return present.get(self.sel, 0)
+
+            async def wait_for(self, state=None, timeout=None):
+                if not present.get(self.sel, 0):
+                    raise RuntimeError("not visible")
+                return True
+
+            async def fill(self, text):
+                calls.append(("fill", self.sel, text))
+
+        class FakePage:
+            async def wait_for_timeout(self, ms):
+                return None
+
+            def locator(self, sel):
+                return FakeLoc(sel)
+
+        return FakePage(), calls, cs
+
+    def test_选择器覆盖两种_placeholder(self):
+        from douyin_publish_mcp import creator_steps as cs
+
+        joined = " ".join(cs._TITLE_INPUT_SELECTORS)
+        self.assertIn("作品标题", joined)
+        # ★ 关键：不能写成写死的"填写作品标题"，否则图文页（"添加作品标题"）就落空
+        for sel in cs._TITLE_INPUT_SELECTORS:
+            self.assertNotIn("填写作品标题", sel, "不要写死'填写'，图文页是'添加'")
+
+    def test_图文页_添加作品标题_能命中(self):
+        """图文页的 placeholder 是「添加作品标题」。"""
+        import asyncio
+
+        from douyin_publish_mcp import creator_steps as cs
+
+        page, calls, _ = self._fake_page({'input[placeholder*="作品标题"]': 1})
+        node = asyncio.run(cs._find_title_input(page, timeout_ms=3000))
+        asyncio.run(node.fill("标题"))
+        self.assertEqual(calls, [("fill", 'input[placeholder*="作品标题"]', "标题")])
+
+    def test_视频页_填写作品标题_也命中(self):
+        """同一个选择器要能覆盖视频页的「填写作品标题」。"""
+        import asyncio
+
+        from douyin_publish_mcp import creator_steps as cs
+
+        # 视频页：第一个候选命中（因为用的是 *="作品标题"）
+        page, calls, _ = self._fake_page({'input[placeholder*="作品标题"]': 1})
+        node = asyncio.run(cs._find_title_input(page, timeout_ms=3000))
+        self.assertIsNotNone(node)
+
+    def test_第一个候选落空时继续试后面的(self):
+        """★ 兜底逻辑本身也要验：首个候选不命中，不能就地卡死。"""
+        import asyncio
+
+        from douyin_publish_mcp import creator_steps as cs
+
+        page, calls, _ = self._fake_page({
+            'input[placeholder*="标题"]': 1,          # 只有第二个候选命中
+        })
+        node = asyncio.run(cs._find_title_input(page, timeout_ms=4000))
+        asyncio.run(node.fill("兜底命中"))
+        self.assertEqual(calls, [("fill", 'input[placeholder*="标题"]', "兜底命中")])
+
+    def test_全都落空时给出候选清单(self):
+        """一个都没命中 → 报错要把候选选择器列出来（便于下次照着实测改）。"""
+        import asyncio
+
+        from douyin_publish_mcp import creator_steps as cs
+
+        page, _calls, _ = self._fake_page({})
+        with self.assertRaises(Exception) as ctx:
+            asyncio.run(cs._find_title_input(page, timeout_ms=600))
+        self.assertIn("没找到标题输入框", str(ctx.exception))
+        self.assertIn("作品标题", str(ctx.exception))
 
 
 if __name__ == "__main__":

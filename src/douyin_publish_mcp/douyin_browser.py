@@ -79,7 +79,7 @@ PYTHON_ENV = "DOUYIN_BROWSER_PYTHON"                   # 显式指定宿主解�
 #: ★ 只信哈希：Gitee 附件实测出现过"截断后仍是合法 PE 头"的同款问题，没有哈希就不装。
 #: ★ 改这里 = 换发布件，必须同步：客户端 exe_fetch.rs 的登记值、NOTICE、README 资产表。
 DRIVER_URL_DEFAULT = (
-    "https://gitee.com/pan-wenda/douyin/releases/download/v0.3.0/"
+    "https://gitee.com/pan-wenda/douyin/releases/download/v0.3.1/"
     "douyin-browser-driver-win64-patchright-1.58.2.zip"
 )
 DRIVER_SHA_DEFAULT = "8a6de597f21574094d93ee86a1e965330fae32b29aaec458385abd5ae880b03d"

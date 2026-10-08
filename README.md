@@ -77,7 +77,7 @@ v0.3.0 起登录 / 账号检查 / 发布**全部自带**（就放在本包里，
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `DOUYIN_MEDIA_DIR` | 发布必填 | **允许发布的素材根目录**（唯一路径闸门）。给的素材路径必须落在它里面 |
+| `DOUYIN_MEDIA_DIR` | **否** | **可选的**素材根目录白名单。配了 → 素材路径必须落在它里面；不配 → 不限制目录（只校验文件存在） |
 | `DOUYIN_ACCOUNT` | 否 | 默认账号名（默认 `main`）；凭据文件名里用它 |
 | `DOUYIN_TIMEOUT` | 否 | 单次调用超时秒数，默认 900（上传慢，别调太小） |
 | `DOUYIN_PUBLISH_HEADLESS` | 否 | `1`（默认）无头 / `0` 有头 —— **只管发布**；登录**始终有头**（抖音会挑无头，且可能要输短信验证码） |
@@ -89,8 +89,13 @@ v0.3.0 起登录 / 账号检查 / 发布**全部自带**（就放在本包里，
 | `DOUYIN_COOKIE` | 否 | 直接给整串 cookie（容器 / 临时调试用，**只能用于读取**：发布需要完整 storage_state 文件） |
 | `AUTH_TOKEN` | HTTP 形态可选 | 填了就要求 `Authorization: Bearer <token>`；**绑定非本机地址时必填** |
 
-`DOUYIN_MEDIA_DIR` 没配时**所有发布工具都会拒绝执行**并说明怎么配 ——
-这是刻意的：宁可报"没配置"，也不能退化成"整个磁盘可读"。
+**装完就能发，不需要先配任何变量。** `DOUYIN_MEDIA_DIR` 是**可选**的收窄开关：
+不填时任何可读文件都能发布，填了就变成一个硬边界（目录外的文件一律拒绝）。
+想收窄权限（比如只允许发某个素材目录）再填它。
+
+> 早先这个变量是"发布必填"，没配就拒绝发布。但那意味着**装完不配就用不了**，
+> 门槛比收益高，已改成可选（v0.3.0）。配错的代价也更小：填了个不存在的路径会明确报错，
+> 不会静默当成"没配"。
 
 ### 只不装浏览器 / 只想读取行吗？
 
@@ -149,7 +154,8 @@ v0.3.0 起登录 / 账号检查 / 发布**全部自带**（就放在本包里，
 | 合集 | `collection`（合集必须已存在） | 作品没进合集，播放路径少一条 |
 | 长正文/背景音乐 | `note_file`→从文件读正文 / `bgm`（搜索词，非路径） | 正文只能塞在参数里，容易截断 |
 
-> 封面与 `note_file` 同样是**把本机文件交给平台**，所以都走素材目录白名单。
+> 封面与 `note_file` 同样是**把本机文件交给平台**，所以**配了** `DOUYIN_MEDIA_DIR` 时
+> 它们也要走同一道白名单（没配则不限制目录）。
 
 ### 登录为什么是"会话"而不是一次调用
 
@@ -265,7 +271,7 @@ $env:PYTHONPATH="src"
 
 ```powershell
 $env:DOUYIN_COOKIE_FILE="<凭据 json 的绝对路径>"   # 不设就用数据目录里扫码存下的那份
-$env:DOUYIN_MEDIA_DIR="<素材目录绝对路径>"
+$env:DOUYIN_MEDIA_DIR="<素材目录绝对路径>"          # 可选：配了才限制发布目录
 ```
 
 脚本走的是和客户端**完全相同**的 `Server.handle` 路径（不是另写一套调用），每步给
@@ -365,7 +371,7 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ```powershell
 & "$env:LOCALAPPDATA\douyin-publish-mcp\douyin-publish-mcp.exe" --http --port 18080
-# /health → {"status":"ok","service":"douyin-publish-mcp","version":"0.3.0"}
+# /health → {"status":"ok","service":"douyin-publish-mcp","version":"0.3.1"}
 # POST /mcp tools/list → 10 个工具
 ```
 
@@ -385,11 +391,11 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ## 从 Release 安装（使用者）
 
-发布源（Gitee 镜像，本公司账号）：**https://gitee.com/pan-wenda/douyin**（当前 v0.3.0）
+发布源（Gitee 镜像，本公司账号）：**https://gitee.com/pan-wenda/douyin**（当前 v0.3.1）
 
 | 资产 | 用途 |
 | --- | --- |
-| `douyin-publish-mcp.exe` | 服务本体：PyInstaller **onefile** 单文件，约 10.9 MB（11,440,439 字节），**自带 Python 运行时，不用先装 Python** |
+| `douyin-publish-mcp.exe` | 服务本体：PyInstaller **onefile** 单文件，约 10.9 MB（11,446,135 字节），**自带 Python 运行时，不用先装 Python** |
 | `douyin-publish-mcp-win64-onedir.zip` | 整包形态（解压即用；onedir 少一层自解压子进程，停用时更好收） |
 | `douyin-browser-driver-win64-patchright-1.58.2.zip` | 浏览器驱动（**不用手动下**：真缺时服务自己按需取，见下面「浏览器通道」一节） |
 
@@ -406,7 +412,7 @@ Move-Item .\douyin-publish-mcp.exe "$dst\douyin-publish-mcp.exe" -Force
 
 > ★ **但 exe 不是全部**：它自带 Python 运行时、自带发布/登录自动化，却**不自带浏览器驱动**
 > （patchright 那 ~100MB）与浏览器 —— 驱动首次用到时按需取，浏览器用系统 Chrome。
-> 装完 exe 还要配 `DOUYIN_MEDIA_DIR`（发布必填，素材闸门），见上面的前置条件。
+> **装完即可用**：不需要先配任何变量（`DOUYIN_MEDIA_DIR` 是可选的收窄开关），见上面的前置条件。
 
 ---
 
