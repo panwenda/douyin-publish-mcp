@@ -99,7 +99,7 @@ def upload(url, path):
     body = b"".join([
         ("--%s\r\n" % boundary).encode(),
         ('Content-Disposition: form-data; name="file"; filename="%s"\r\n' % fn).encode(),
-        b"Content-Type: application/octet-stream\r\r\n",
+        b"Content-Type: application/octet-stream\r\n\r\n",
         data,
         ("\r\n--%s--\r\n" % boundary).encode(),
     ])
