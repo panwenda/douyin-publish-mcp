@@ -1,6 +1,6 @@
 [project]
 name = "douyin-publish-mcp"
-version = "0.3.1"
+version = "0.3.2"
 description = "薄 MCP：抖音发布（登录/检查/发视频/发图文）+ 读取（搜索/详情/用户主页/我的主页/分享解析），共 10 个 MCP 工具"
 readme = "README.md"
 requires-python = ">=3.9"
