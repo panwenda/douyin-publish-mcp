@@ -99,9 +99,9 @@ class Credential:
         if not self.cookie:
             base = (
                 "没有可用的抖音凭据。读取工具需要登录态：请先调 douyin_account_login "
-                "让用户扫码（凭据由 sau 写进项目目录的 cookies/）。"
+                "让用户扫码（凭据由本服务写进数据目录）。"
             )
-            # ★ 必须带上"为什么定位不到"：只配了 SAU_CMD（没有项目目录）的人，
+            # ★ 必须带上"为什么定位不到"：只配了 DOUYIN_COOKIE_FILE（但文件坏了）的人，
             #   光看上面那句会去扫码，而扫码在这条配置下解决不了问题
             return base + ("\n" + self.source if self.source else "")
         state = "已登录" if self.has_login else "匿名（无 sessionid 等登录 cookie）"
@@ -240,7 +240,7 @@ def resolve_credential(cfg: RuntimeConfig, account: str = "") -> Credential:
     1. `DOUYIN_COOKIE_FILE`：显式指定的文件（storage_state 或裸 Cookie 串）——
        给"读取和发布不是一个账号/不在一个项目目录"的人留的口子；
     2. `DOUYIN_COOKIE`：直接给整串 cookie（容器/临时调试用）；
-    3. `<SAU_DIR>/cookies/douyin_<账号>.json`：**正常路径**，与发布共用同一份登录态。
+    3. `<数据目录>/douyin_<账号>.json`：**正常路径**，与发布共用同一份登录态。
 
     ★ 顺序即优先级：显式配置永远压过推导出来的路径 —— 环境里的残留文件
       不应该盖掉用户明说的东西。
@@ -255,7 +255,7 @@ def resolve_credential(cfg: RuntimeConfig, account: str = "") -> Credential:
         except OSError as e:
             raise ConfigError(
                 f"读不到 DOUYIN_COOKIE_FILE 指向的文件：{path}（{e.strerror or e}）。"
-                f"请核对路径，或去掉这个环境变量改用 sau 的凭据文件。"
+                f"请核对路径，或去掉这个环境变量改用默认凭据文件。"
             ) from None
         cred = credential_from_raw(raw, f"DOUYIN_COOKIE_FILE（{path}）", account, path)
         if not cred.usable:
@@ -280,11 +280,11 @@ def resolve_credential(cfg: RuntimeConfig, account: str = "") -> Credential:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return Credential(
-            source=f"读不到 sau 凭据文件（{path}：{e.strerror or e}）", account=account, path=path
+            source=f"读不到凭据文件（{path}：{e.strerror or e}）", account=account, path=path
         )
     cred = credential_from_raw(raw, f"本服务数据目录的凭据文件（{path}）", account, path)
     if not cred.cookie:
-        cred.source = f"sau 凭据文件里没有 cookie（{path}）"
+        cred.source = f"凭据文件里没有 cookie（{path}）"
     return cred
 
 

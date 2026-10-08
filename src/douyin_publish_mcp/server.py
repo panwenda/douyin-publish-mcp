@@ -1,4 +1,4 @@
-﻿"""薄 MCP 服务：把 social-auto-upload 的抖音能力封成 5 个工具。
+﻿"""MCP 服务：抖音发布与读取，共 10 个工具。
 
 工具：`douyin_account_status` / `douyin_account_login` / `douyin_account_logout` /
 `douyin_publish_video` / `douyin_publish_note`。两种传输共用这一份实现
@@ -74,24 +74,24 @@ PUBLISH_RULE = (
 )
 
 # 读取类工具共用的账号参数（★ 做成可选：多数场景只有一个号，
-#   每次都逼模型问用户"账号名是什么"是没必要的摩擦；默认取 SAU_ACCOUNT/DOUYIN_ACCOUNT，兜底 main）
+#   每次都逼模型问用户"账号名是什么"是没必要的摩擦；默认取 DOUYIN_ACCOUNT，兜底 main）
 _ACCOUNT_SCHEMA_READ = {
     "type": "string",
-    "description": "账号名（social-auto-upload 里登录时用的名字）。不传则用默认账号（SAU_ACCOUNT，兜底 main）。",
+    "description": "账号名。不传则用默认账号（DOUYIN_ACCOUNT，兜底 main）。",
 }
 
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "douyin_account_status",
         "description": (
-            "查询某个抖音账号在 social-auto-upload 里的登录态（本地 cookie 是否还有效）。"
+            "查询某个抖音账号的登录态（本地凭据文件是否还有效）。"
             "发布/登录前先查一次，避免发到一半才发现没登录。"
             "account 是登录时用的账号名（不是抖音昵称）。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "account": {"type": "string", "description": "账号名（social-auto-upload 里登录时用的名字）"},
+                "account": {"type": "string", "description": "账号名（登录时自定义的名字）"},
             },
             "required": ["account"],
             "additionalProperties": False,
@@ -104,7 +104,7 @@ TOOLS: List[Dict[str, Any]] = [
             "★ 会弹出一个**真浏览器窗口**：登录这一步必须用真窗口 —— 抖音的反自动化会挑无头浏览器，"
             "而且可能要求短信二次验证，那只能在窗口里手动输。"
             "二维码同时也会作为**图片**返回（和窗口里是同一个码），展示给用户扫也行。"
-            "**扫码成功后窗口会自动关闭**（sau 存完 cookie 就关掉浏览器并退出，约 2 秒后消失）；"
+            "**扫码成功后窗口会自动关闭**（存完 cookie 就关掉浏览器并退出，约 2 秒后消失）；"
             "若一直没人扫，窗口最多活 2 分钟也会自己关，不会一直挂在用户屏幕上。"
             "调用会等一段（wait_seconds）：扫得快就一次拿到结论；"
             "还在等就返回「会话仍在等待扫码」，此时**再调一次本工具**即可继续查，不要重复发起新登录。"
@@ -131,7 +131,7 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "douyin_account_logout",
         "description": (
             "重置某个账号的登录态（相当于小红书 MCP 的 delete_cookies）。"
-            "本服务**只删一个文件**：<项目>/cookies/douyin_<账号>.json —— 那是 sau 的登录凭据。"
+            "本服务**只删一个文件**：<数据目录>/douyin_<账号>.json —— 那是本服务的登录凭据。"
             "★ 两步：不传 confirm 时只回报「将要删除的路径」，什么都不删；"
             "用户明确同意后才传 confirm=true。删完该账号变回未登录，发布前要重新扫码。"
             "注意这是「退出登录」不是「卸载」：项目目录、素材、已发布的作品都不受影响。"
@@ -370,9 +370,9 @@ def tool_account_status(
 ) -> Dict[str, Any]:
     """查登录态。
 
-    ★ 判据以 `sau douyin check` 的**退出码**为准（0=valid / 1=invalid，见 sau_cli.py），
-      文本只在退出码说不出话时兜底 —— 早先版本纯靠文本里找「未登录」三个字，
-      CLI 一改文案就会静默变成"猜不出来"。
+    ★ 判据是**直连探针**（打抖音的用户资料接口）：
+      能拿到自己的资料 = 已登录；被风控挡住 = 如实说「判不出来」，
+      绝不猜成「没登录」—— 那会让用户白扫一次码。
     """
     account = _require_str(args, "account")
     sessions = sessions or LoginSessionManager(cfg)
@@ -710,7 +710,7 @@ def _render_publish_result(payload: Dict[str, Any], kind: str, plan: Dict[str, A
     return _text(body, is_error=not payload.get("ok"))
 
 
-# ── 读取工具（HTTP 直连；登录态与发布共用 sau 的凭据文件）──────────
+# ── 读取工具（HTTP 直连；登录态与发布共用同一份凭据文件）──────────
 #
 # ★ 与发布工具的分工：发布**动账号**，所以有 confirm 门禁；读取**只看**，
 #   所以不设门禁 —— 但也因此对失败要说得更清楚（空结果 vs 被风控，见 DouyinWebError.kind）。
@@ -1051,8 +1051,8 @@ def _manual_login_hint(cfg: RuntimeConfig, account: str) -> str:
 def main() -> int:
     cfg = RuntimeConfig.from_env()
     print(
-        f"[{SERVER_NAME}] 就绪：SAU_CMD={cfg.cmd or '(未设置)'} SAU_DIR={cfg.project_dir or '(未设置)'} "
-        f"素材目录={cfg.media_dir or '(未设置)'} 超时={cfg.timeout}s",
+        f"[{SERVER_NAME}] 就绪：素材目录={cfg.media_dir or '(未设置)'} "
+        f"账号={cfg.account} 超时={cfg.timeout}s",
         file=sys.stderr,
         flush=True,
     )

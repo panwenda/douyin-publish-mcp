@@ -54,7 +54,43 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _force_utf8_stdio() -> None:
+    """把 stdin/stdout/stderr 钉成 UTF-8。
+
+    ★ 为什么必须显式做：stdio 形态下 stdout 就是 MCP 协议通道，规范要求 UTF-8。
+      但 Windows 上 Python 默认按 `locale.getpreferredencoding()` 取 **cp936**，
+      而 `json.dumps(..., ensure_ascii=False)`（见 `server.serve`）会把中文**原样**写出去
+      → 客户端按 UTF-8 读到的全是乱码 / `U+FFFD`（JSON 结构还在，坏的是值，
+      表现成"工具列得出来、但描述和所有中文返回都是乱码"，很难第一时间联想到编码）。
+
+    ★ 为什么连 stderr 一起钉：它不是协议通道，但**承载用户可读的中文诊断**
+      （启动就绪行、"收到非 JSON 行"、"工具 xx 异常"…）。客户端会把 stderr 收进日志面板，
+      那一侧按 UTF-8 解 —— 不钉的话日志全是乱码，排查时反而被误导。
+      实测：只钉 stdout 后，stderr 仍然写 GBK（`\xbe\xcd\xd0\xf7` = "就绪"）。
+
+    ★ 为什么不能只靠 `PYTHONUTF8=1`：源码方式跑时它有效，但**打包成 exe 后启动环境
+      由宿主决定** —— 实测同一个 shell 里 exe 仍然写 GBK（`PYTHONIOENCODING`/
+      `PYTHONUTF8` 都传了也没用）。所以只能自己钉。
+
+    `reconfigure` 是 3.7+ 的流方法；重定向到非文本流时没有它，故用 getattr 兜住。
+    对 `--creator-helper` / `--browser-helper` 同样生效（它们本来就 `ensure_ascii=True`，
+    这里是双保险）。
+    """
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            # 流已关闭/不可重配（极少见）：不值得让服务起不来，交给默认行为。
+            pass
+
+
 def main(argv=None) -> int:
+    # ★ 必须最早执行：下面任何一句都可能往 stdout/stderr 写中文。
+    _force_utf8_stdio()
     args = build_parser().parse_args(argv)
     if args.browser_helper:
         from .browser_helper import main as helper_main

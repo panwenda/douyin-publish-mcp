@@ -4,14 +4,18 @@
 
 这个服务的失败方式分两类，验证成本差一个数量级：
 
-| | 本地段（不需要 sau / 不联网） | 真机段（要 sau + 登录态 + 外网） |
+| | 本地段（不联网、不碰账号） | 真机段（要登录态 + 外网 + 浏览器） |
 | --- | --- | --- |
 | 协议层 | ✅ initialize / tools/list / schema | |
-| 发布门禁 | ✅ 预检 + 两条拦截（**一行 CLI 都不跑**） | |
+| 发布门禁 | ✅ 预检 + 两条拦截（**一个 helper 进程都不起**） | |
 | HTTP 形态 | ✅ 真起服务、真发请求、真验鉴权 | |
-| 登录态 | | ✅ `sau douyin check` |
+| 登录态 | | ✅ 直连探针查本地凭据 |
 | 读取五连 | | ✅ 搜索 / 详情 / 主页 / 分享（会真调抖音接口，并标明走的哪条通道） |
 | 浏览器通道 | | ✅ 详情 + 评论（**单独验**：它平时是"被回退才出场"，只靠工具 PASS 会漏掉它坏了） |
+
+★ v0.3.0 起本服务**自带**登录/发布/账号检查（不再调 `sau` CLI），所以本地段不再需要
+  "有 sau 才跑得起来"这个前提 —— 只装 Python 就能给出结论。`SAU_*` 环境变量全部作废，
+  统一到 `DOUYIN_*`（发布闸门仍是 `DOUYIN_MEDIA_DIR`）。
 
 本地段全绿只说明"这个服务的壳是对的"，**不说明抖音认它**。所以脚本最后会把
 "还没验过的"单独列出来 —— SKIP 从来不算通过。
@@ -36,8 +40,8 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
-import shutil
 import sys
 import tempfile
 import threading
@@ -52,10 +56,11 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from douyin_publish_mcp import douyin_browser as browser  # noqa: E402
+from douyin_publish_mcp.config import RuntimeConfig  # noqa: E402
 from douyin_publish_mcp.douyin_cred import default_account, resolve_credential  # noqa: E402
 from douyin_publish_mcp.douyin_web import DouyinWebClient, DouyinWebError, WebConfig  # noqa: E402
 from douyin_publish_mcp.http_server import App, make_handler  # noqa: E402
-from douyin_publish_mcp.sau import SauConfig  # noqa: E402
 from douyin_publish_mcp.server import TOOLS, Server  # noqa: E402
 
 TESTS_DIR = ROOT / "tests"
@@ -143,8 +148,8 @@ def _channel_of(text: str) -> str:
 
 
 # ── 本地段 ──────────────────────────────────────────────────
-# ★ 本地段的共同点：**不联网、不跑 sau、不碰账号**。
-#   所以它们在你还没装 social-auto-upload 的机器上也能给出结论。
+# ★ 本地段的共同点：**不联网、不起 helper 进程、不碰账号**。
+#   所以它们在任何装了 Python 的机器上都能给出结论。
 
 
 def step_unit_tests() -> None:
@@ -176,7 +181,7 @@ def step_unit_tests() -> None:
 
 def step_protocol() -> None:
     """协议层：客户端第一步就会打的这两个请求。"""
-    server = Server(SauConfig())
+    server = Server(RuntimeConfig())
     resp = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
     info = (resp or {}).get("result", {}).get("serverInfo", {})
     if not info.get("name"):
@@ -202,25 +207,29 @@ def step_protocol() -> None:
 
 
 def step_publish_gate() -> None:
-    """发布门禁：**用临时素材**跑预检与两条拦截，并断言"一行 CLI 都没跑"。
+    """发布门禁：**用临时素材**跑预检与两条拦截，并断言"一个 helper 进程都没起"。
 
     ★ 这是本地最有价值的一步：它验的是"这个服务会不会在用户没点头时动账号"。
-      素材是临时造的假 mp4（预检只看路径/存在/非空），所以不需要真素材、也不需要 sau。
+      素材是临时造的假 mp4（预检只看路径/存在/非空），所以不需要真素材、也不需要登录态。
+
+    ★ v0.3.0 起"会不会动账号"的判据从"跑没跑 CLI"变成"起没起 helper 进程"
+      （发布/登录/账号检查都跑在 `--creator-helper` 子进程里，见 `browser.run_helper`）。
+      门禁阶段**任何一次 helper 启动都是最严重的问题**，所以这里打桩成直接炸。
     """
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "media").mkdir()
         (root / "media" / "verify.mp4").write_bytes(b"\x00" * 64)
-        cfg = SauConfig(cmd="sau", project_dir=str(root / "sau"), media_dir=str(root / "media"))
+        cfg = RuntimeConfig(media_dir=str(root / "media"))
         server = Server(cfg)
 
-        cli_calls = []
+        helper_calls = []
 
-        def fake_run(*args, **kwargs):
-            cli_calls.append(args)
-            raise AssertionError("门禁阶段不该跑任何 CLI")
+        def fake_run_helper(*args, **kwargs):
+            helper_calls.append(args)
+            raise AssertionError("门禁阶段不该起任何 helper 进程")
 
-        with mock.patch("douyin_publish_mcp.sau.run", side_effect=fake_run):
+        with mock.patch.object(browser, "run_helper", side_effect=fake_run_helper):
             base = {"account": "verify", "file": "verify.mp4", "title": "验收-可忽略"}
             result, err = call(server, "douyin_publish_video", base, req_id=10)
             text = text_of(result)
@@ -244,24 +253,38 @@ def step_publish_gate() -> None:
                 f"{text_of(result2)[:300]}\n{text_of(result3)[:300]}",
             )
             return
-        if cli_calls:
-            record(FAIL, "发布门禁", f"★ 门禁阶段跑了 {len(cli_calls)} 次 CLI，这是最严重的一类问题")
+        if helper_calls:
+            record(FAIL, "发布门禁", f"★ 门禁阶段起了 {len(helper_calls)} 个 helper 进程，这是最严重的一类问题")
             return
         record(
             PASS,
             "发布门禁：预检 + 两条拦截",
-            f"只返回计划（plan_id={plan_id}）；plan_id 不符与内容改过都被拒；全程 0 次 CLI 调用",
+            f"只返回计划（plan_id={plan_id}）；plan_id 不符与内容改过都被拒；全程 0 个 helper 进程",
         )
 
 
 def step_http() -> None:
-    """HTTP 形态：真起服务、真发请求，验端点、鉴权与状态页。"""
+    """HTTP 形态：真起服务、真发请求，验端点、鉴权与状态页。
+
+    ★ 这里有一个"无凭据"用例，所以必须**自己把凭据环境清干净**再跑：
+      外层可能为了真机段设了 `DOUYIN_COOKIE_FILE`（真机段就需要它），
+      不清的话这个用例会读到真账号，断言"应该报没凭据"就必然失败 ——
+      而那是用例自己的环境假设错了，不是服务错了。
+    """
     buf = io.StringIO()
     real_stderr = sys.stderr
     # ★ 服务的访问日志走 stderr（这是它的正常行为），但验收输出里不需要它们
     sys.stderr = buf
     try:
-        _step_http_body()
+        with tempfile.TemporaryDirectory() as data_dir:
+            env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("DOUYIN_COOKIE", "DOUYIN_COOKIE_FILE", "DOUYIN_DATA_DIR")
+            }
+            env["DOUYIN_DATA_DIR"] = data_dir  # 空目录 = 一定没有凭据文件
+            with mock.patch.dict(os.environ, env, clear=True):
+                _step_http_body()
     finally:
         sys.stderr = real_stderr
 
@@ -270,7 +293,7 @@ def _step_http_body() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "media").mkdir()
-        cfg = SauConfig(cmd="sau", project_dir=str(root), media_dir=str(root / "media"))
+        cfg = RuntimeConfig(media_dir=str(root / "media"))
         app = App(cfg, token="verify-token")
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
         httpd.daemon_threads = True
@@ -361,41 +384,37 @@ def _http(method: str, url: str, headers=None, payload=None):
         return e.code, e.read()
 
 
-# ── 真机段（需要 sau + 登录态 + 外网）────────────────────────
+# ── 真机段（需要登录态 + 外网 + 浏览器）──────────────────────
 
 
-def step_env(cfg: SauConfig, account: str) -> bool:
+def step_env(cfg: RuntimeConfig, account: str) -> bool:
+    """环境前置：只看"发布/读取需要的东西在不在"，**不发任何网络请求**。
+
+    ★ v0.3.0 起不再检查 `sau`（那套 CLI 已经不用了），改成三件事：
+      ① 素材目录配了并在（发布闸门，没配就拒绝发布）；
+      ② 有一份能用的登录态（读取与发布共用）；
+      ③ 浏览器通道的驱动就位（读取的详情/评论靠它兜底）。
+    """
     problems = []
-    if cfg.cmd:
-        if not Path(cfg.cmd).is_file():
-            problems.append(f"SAU_CMD 指向的文件不存在：{cfg.cmd}")
-    elif cfg.project_dir:
-        if not Path(cfg.project_dir).is_dir():
-            problems.append(f"SAU_DIR 指向的目录不存在：{cfg.project_dir}")
-        elif not shutil.which(cfg.uv):
-            problems.append(f"SAU_DIR 已配，但找不到 uv（{cfg.uv}）—— 需要用 uv 拉起 sau")
-    elif not shutil.which("sau"):
-        problems.append(
-            "SAU_CMD / SAU_DIR 都没配，PATH 里也没有 sau。"
-            "请到 MCP 配置页填 SAU_CMD（sau.exe 绝对路径）或 SAU_DIR（项目根目录）"
-        )
     if not cfg.media_dir:
-        problems.append("SAU_MEDIA_DIR 没配：发布工具会拒绝执行（读取不受影响）")
+        problems.append("DOUYIN_MEDIA_DIR 没配：发布工具会拒绝执行（读取不受影响）")
     elif not Path(cfg.media_dir).is_dir():
         problems.append(f"素材目录不存在：{cfg.media_dir}")
-
     if problems:
         record(FAIL, "真机：环境前置", "\n".join("· " + p for p in problems))
         return False
+
+    bcfg = browser.BrowserConfig.from_env()
+    note = browser.describe(bcfg, cfg)
     try:
         cred = resolve_credential(cfg, account)
     except Exception as e:  # noqa: BLE001 —— 验收脚本不该因为一个配置问题直接崩
-        record(FAIL, "真机：环境前置（凭据）", f"定位凭据时出错：{e}")
+        record(FAIL, "真机：环境前置（凭据）", f"定位凭据时出错：{e}\n· {note}")
         return False
     if not cred.usable:
         record(SKIP, "真机：环境前置", "配置就绪，但没有可用凭据（还没扫码登录）\n" + cred.describe())
         return False
-    record(PASS, "真机：环境前置", cred.describe().replace("\n", "；"))
+    record(PASS, "真机：环境前置", cred.describe().replace("\n", "；") + f"｜{note}")
     return True
 
 
@@ -406,17 +425,17 @@ def step_login(server: Server, account: str) -> bool:
         return False
     text = text_of(result)
     if "已登录，可以发布" in text:
-        record(PASS, "真机：登录态", "sau douyin check 判定为已登录")
+        record(PASS, "真机：登录态", "直连探针判定为已登录（不依赖外部 CLI）")
         return True
     if "未登录" in text:
         record(
             FAIL,
             "真机：登录态",
-            "本地 cookie 不存在或已失效。下一步：调 douyin_account_login 让用户扫码\n"
+            "本地凭据不存在或已失效。下一步：调 douyin_account_login 让用户扫码\n"
             + text.splitlines()[0],
         )
         return False
-    record(SKIP, "真机：登录态", "退出码与输出都没给出明确结论：\n" + text[:400])
+    record(SKIP, "真机：登录态", "探针没给出明确结论（可能被风控挡了）：\n" + text[:400])
     return False
 
 
@@ -489,7 +508,7 @@ def step_read(server: Server, account: str, keyword: str) -> str:
     return aweme_id
 
 
-def step_browser_channel(cfg: SauConfig, account: str, aweme_id: str) -> None:
+def step_browser_channel(cfg: RuntimeConfig, account: str, aweme_id: str) -> None:
     """浏览器通道单独验一遍：**别只看那四个工具"过了"**。
 
     ★ 为什么必须单独验（这是它唯一会被漏掉的方式）：
@@ -565,7 +584,7 @@ def step_browser_channel(cfg: SauConfig, account: str, aweme_id: str) -> None:
     )
 
 
-def step_publish_real(cfg: SauConfig, account: str, media_file: str, title: str, confirm_publish: bool) -> None:
+def step_publish_real(cfg: RuntimeConfig, account: str, media_file: str, title: str, confirm_publish: bool) -> None:
     """用**用户自己的素材**跑预检（可选真发）。★ 默认只预检。"""
     if not media_file:
         record(SKIP, "真机：发布", "没给 --publish-file，跳过")
@@ -600,18 +619,18 @@ def step_publish_real(cfg: SauConfig, account: str, media_file: str, title: str,
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="douyin-publish-mcp 端到端验收")
-    parser.add_argument("--local-only", action="store_true", help="只跑本地段（不联网、不碰 sau）")
-    parser.add_argument("--account", default="", help="账号名（默认取 SAU_ACCOUNT，兜底 main）")
+    parser.add_argument("--local-only", action="store_true", help="只跑本地段（不联网、不碰账号）")
+    parser.add_argument("--account", default="", help="账号名（默认取 DOUYIN_ACCOUNT，兜底 main）")
     parser.add_argument("--keyword", default="美食", help="搜索用关键词（默认 美食）")
     parser.add_argument("--publish-file", default="", help="用你自己的素材做发布预检（素材目录内路径）")
     parser.add_argument("--publish-title", default="验收测试-可忽略", help="预检用的标题")
     parser.add_argument("--confirm-publish", action="store_true", help="★ 真的发出去（默认只验门禁）")
     args = parser.parse_args(argv)
 
-    cfg = SauConfig.from_env()
+    cfg = RuntimeConfig.from_env()
     account = (args.account or default_account()).strip()
     print(f"账号：{account}｜关键词：{args.keyword}｜模式：{'仅本地' if args.local_only else '本地 + 真机'}")
-    print("本地段：不联网、不跑 sau、不碰账号。真机段：会真调抖音接口与 sau（默认仍不发布）。")
+    print("本地段：不联网、不起 helper、不碰账号。真机段：会真调抖音接口与浏览器（默认仍不发布）。")
 
     banner("1/4 单测")
     step_unit_tests()
@@ -646,7 +665,7 @@ def main(argv=None) -> int:
     else:
         for name in ("真机：环境前置", "真机：登录态", "真机：读取五连",
                      "真机：浏览器通道", "真机：发布"):
-            _skip(name, "本次是 --local-only；这些需要 sau 与登录态，本地验不了")
+            _skip(name, "本次是 --local-only；这些需要登录态与外网，本地验不了")
 
     banner("汇总" if args.local_only else "8/8 汇总")
     fails = [r for r in RESULTS if r[0] == FAIL]
@@ -665,7 +684,7 @@ def main(argv=None) -> int:
         print("本地段已通过的部分是真的通过了；FAIL 项按上面的说明修，再重跑本脚本。")
     elif skips:
         print("没有 FAIL，但跳过项还没验过 —— 本地段全绿只说明「服务的壳是对的」，")
-        print("不说明抖音认它。要判读取通道通不通，得在装了 sau 的机器上跑不带 --local-only 的那遍。")
+        print("不说明抖音认它。要判读取通道通不通，得在有登录态 + 外网的机器上跑不带 --local-only 的那遍。")
     else:
         print("全绿。")
     return 1 if fails else 0

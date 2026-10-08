@@ -250,5 +250,60 @@ class TestSpecContract(SessionCase):
         self.assertGreater(spec["max_wait_sec"], 0)
 
 
+class TestAccountCheckFailurePaths(SessionCase):
+    """`check_account()` 的**失败分支**必须给出可读提示，不是内部错误。
+
+    ★ 为什么单独钉：两条失败分支拼文案时用了 `exc.message`，而 `DouyinWebError`
+      原先只在 `__init__` 里把 message 交给了 `super()`，自己**没留这个属性** ——
+      于是"凭据失效"与"被风控挡住"（都是预期内的正常失败）会抛
+      `AttributeError: 'DouyinWebError' object has no attribute 'message'`，
+      把一句有用的「下一步：重新扫码」变成一个吓人的内部错误。实测踩到。
+    """
+
+    def _cred_file(self, cookie="sessionid=abc; ttwid=xyz"):
+        p = self.root / "douyin_main.json"
+        p.write_text(json.dumps({"cookies": [
+            {"name": k, "value": v, "domain": ".douyin.com"}
+            for k, v in (kv.split("=", 1) for kv in cookie.split("; "))
+        ]}), encoding="utf-8")
+        return p
+
+    def _run_check(self, raise_kind, raise_msg="探针挂了"):
+        from douyin_publish_mcp.account import check_account
+        from douyin_publish_mcp.douyin_web import DouyinWebError
+
+        self._cred_file()
+        cfg = RuntimeConfig(media_dir=str(self.root), account="main", timeout=30)
+
+        def boom(self, *a, **k):
+            raise DouyinWebError(raise_msg, kind=raise_kind)
+
+        with mock.patch.dict(os.environ, {"DOUYIN_COOKIE_FILE": str(self.root / "douyin_main.json")}):
+            with mock.patch.object(
+                __import__("douyin_publish_mcp.douyin_web", fromlist=["DouyinWebClient"]).DouyinWebClient,
+                "my_profile", boom,
+            ):
+                return check_account(cfg, "main")
+
+    def test_凭据失效时给重新扫码的指引而不是报错(self):
+        res = self._run_check("no_credential", "凭据里的登录标识已失效")
+        body = res.output
+        self.assertIn("未登录", body)
+        self.assertIn("重新扫码", body, "应给出下一步动作")
+        self.assertIn("凭据里的登录标识已失效", body, "原始原因要保留")
+        self.assertNotIn("AttributeError", body)
+        self.assertFalse(res.logged_in)
+
+    def test_被风控挡住时说判不出来而不是说没登录(self):
+        res = self._run_check("blocked", "403 Blocked by ArgusSecurityPlugin")
+        body = res.output
+        self.assertIn("判不出来", body)
+        self.assertIn("blocked", body)
+        self.assertIn("403 Blocked", body)
+        self.assertNotIn("AttributeError", body)
+        # ★ 关键语义：判不出来 ≠ 没登录，绝不能说"你没登录"（会骗用户重扫）
+        self.assertIsNone(res.logged_in, "被风控时结论必须是 None，不能是 False")
+
+
 if __name__ == "__main__":
     unittest.main()

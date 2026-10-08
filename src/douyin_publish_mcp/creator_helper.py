@@ -6,6 +6,12 @@
 - stdout 只有最后那一行 JSON，`ensure_ascii=True`（跨代码页不会变乱码）；
 - 退出码 0 表示成功、1 表示失败 —— 但**结论以 JSON 为准**，退出码只是给 shell 看的。
 
+★ 和 `browser_helper` 一样，**必须先 `_extend_sys_path()` 再导入任何用到驱动的模块**：
+  冻结（PyInstaller）之后本进程的 `sys.path` 由引导器定，`PYTHONPATH` 不再生效，
+  驱动目录只能靠 `DOUYIN_BROWSER_DRIVER_PATH` 显式插进来。漏了这一步的表现正是
+  `发布失败（no_driver）：No module named 'patchright'` —— 而读取却正常
+  （读取走 `browser_helper`，那边有这一步）。**同一个 exe 里两条 helper 路径都得插。**
+
 这样主进程（服务本身）不需要浏览器驱动：exe 保持小，驱动按需取。
 """
 
@@ -44,6 +50,16 @@ def main(argv=None) -> int:
     if not argv:
         sys.stderr.write("用法：--creator-helper <spec.json>\n")
         return 2
+
+    # ★ 必须最早执行、且必须在 `_run` 里那些 `from .creator* import ...` **之前**：
+    #   那几个模块在导入期就会 `from patchright...`，sys.path 晚插一步就来不及
+    #   （已经在 `sys.modules` 里留下失败的痕迹，表现为 no_driver）。
+    from .browser_helper import _extend_sys_path
+
+    added = _extend_sys_path()
+    if added:
+        sys.stderr.write("driver path: %s\n" % " | ".join(added))
+
     payload: Dict[str, Any]
     try:
         # utf-8-sig：调用方是我们自己（不带 BOM），但手写/记事本改过的 spec 可能带，

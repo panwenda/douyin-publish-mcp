@@ -646,6 +646,90 @@ class TestServeLoop(ServerCase):
         self.assertIn("非 JSON", err.getvalue())
 
 
+class TestStdioEncoding(unittest.TestCase):
+    """stdio 形态的 stdout 必须是 UTF-8。
+
+    ★ 为什么单独立一条：这不是"排版问题"，而是**协议合规问题** —— MCP 规定
+      stdio 的每行是一个 UTF-8 的 JSON-RPC 对象。Windows 上 Python 默认按
+      `locale.getpreferredencoding()` 取 cp936，而 `server.serve()` 用
+      `json.dumps(..., ensure_ascii=False)` 会把中文原样写出去
+      → 客户端严格按 UTF-8 解码直接 `UnicodeDecodeError`，宽松解码则满屏 `U+FFFD`。
+      现象是"工具列得出来、但描述和所有中文返回都是乱码"，很难第一时间想到编码。
+
+    ★ 为什么必须由**代码**钉、不能靠环境变量：源码方式跑时 `PYTHONUTF8=1` 有效，
+      但**打包成 exe 后启动环境由宿主决定** —— 实测同一个 shell 里 exe 仍然写 GBK
+      （`PYTHONIOENCODING`/`PYTHONUTF8` 都传了也没用）。
+      所以 `__main__._force_utf8_stdio()` 得自己调 `reconfigure`。
+    """
+
+    def test_入口会强制把_stdio_钉成_utf8(self):
+        import io
+        from douyin_publish_mcp import __main__ as entry
+
+        made = []
+
+        class FakeStream:
+            def __init__(self):
+                self.kwargs = None
+
+            def reconfigure(self, **kwargs):
+                self.kwargs = kwargs
+                made.append(kwargs)
+
+        fake_in, fake_out, fake_err = FakeStream(), FakeStream(), FakeStream()
+        with mock.patch.object(entry.sys, "stdin", fake_in), \
+             mock.patch.object(entry.sys, "stdout", fake_out), \
+             mock.patch.object(entry.sys, "stderr", fake_err):
+            entry._force_utf8_stdio()
+
+        # ★ stderr 也要钉：它承载"就绪"这类用户可读中文诊断，客户端日志面板按 UTF-8 解。
+        self.assertEqual(fake_in.kwargs, {"encoding": "utf-8"})
+        self.assertEqual(fake_out.kwargs, {"encoding": "utf-8"})
+        self.assertEqual(fake_err.kwargs, {"encoding": "utf-8"})
+
+    def test_没有_reconfigure_的流不许炸(self):
+        """被重定向成非文本流时没有 reconfigure —— 跳过即可，不能因此起不来。"""
+        from douyin_publish_mcp import __main__ as entry
+
+        with mock.patch.object(entry.sys, "stdin", object()), \
+             mock.patch.object(entry.sys, "stdout", object()), \
+             mock.patch.object(entry.sys, "stderr", object()):
+            entry._force_utf8_stdio()  # 不抛异常即通过
+
+    def test_修复后中文落盘是_utf8_而不是_gbk(self):
+        """★ 真回归用例：先造一个 **GBK** 的 stdout（模拟 Windows 默认 + 打包后的 exe），
+        跑完 `_force_utf8_stdio()` 再写中文，字节必须是合法 UTF-8。
+
+        ★ 为什么不能直接 `TextIOWrapper(buf, encoding="utf-8")` 了事 —— 那样等于把
+          被测结论写进了测试前提，没有修复时也会通过。
+        """
+        import io
+        from douyin_publish_mcp import __main__ as entry
+
+        # ① 先证明确实会按 GBK 写（用独立的缓冲区，别和下面那段混在一起）
+        probe_buf = io.BytesIO()
+        probe = io.TextIOWrapper(probe_buf, encoding="gbk", newline="")
+        probe.write("查询")
+        probe.flush()
+        self.assertEqual(probe_buf.getvalue(), b"\xb2\xe9\xd1\xaf",
+                         "前提不成立：这个流并没按 GBK 写，用例失去意义")
+
+        # ② 换成被测流：同样起于 GBK，经修复后必须落 UTF-8
+        buf = io.BytesIO()
+        gbk_out = io.TextIOWrapper(buf, encoding="gbk", newline="")
+        with mock.patch.object(entry.sys, "stdout", gbk_out):
+            entry._force_utf8_stdio()
+            entry.sys.stdout.write("查询某个抖音账号的登录态")
+            entry.sys.stdout.flush()
+
+        raw = buf.getvalue()
+        # UTF-8 的"查询"= E6 9F A5 E8 AF A2（GBK 是 B2 E9 D1 AF）
+        self.assertIn(b"\xe6\x9f\xa5\xe8\xaf\xa2", raw,
+                      "stdout 没被钉成 UTF-8：中文仍按 GBK 写出去了")
+        self.assertNotIn(b"\xb2\xe9\xd1\xaf", raw, "仍有 GBK 字节残留")
+        self.assertIn("查询某个抖音账号的登录态", raw.decode("utf-8"))
+
+
 class FakeWeb:
     """假的 urlopen 返回值（读取通道的用例全靠它，**不联网**）"""
 

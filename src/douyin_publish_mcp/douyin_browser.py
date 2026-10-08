@@ -19,8 +19,8 @@
 1. **宿主永远是我们自己**：冻结后是 `douyin-publish-mcp.exe --browser-helper <spec>`，
    开发期是 `python browser_helper.py <spec>`。exe 里不放驱动，也不放浏览器。
 2. **驱动按需取**：`patchright`（纯 Python，含 node driver）只在**真的要用且真的缺**时，
-   才从我们自己的发布源/本地归档解到运行时目录；也能直接复用它本来就在的地方
-   （`DOUYIN_BROWSER_SITE_PACKAGES`，或 social-auto-upload 虚拟环境里那份）。
+   才从我们自己的发布源/本地归档解到运行时目录；也能指到本机已有的那份
+   （`DOUYIN_BROWSER_SITE_PACKAGES`）。
 3. **浏览器先用系统 Chrome**：实测系统 Chrome（153.x）就够，**不下载 ~170MB 的 chromium**；
    起不来（机器上没 Chrome）才退回自带的那份，自带那份也没有才去下载。
 
@@ -79,7 +79,7 @@ PYTHON_ENV = "DOUYIN_BROWSER_PYTHON"                   # 显式指定宿主解�
 #: ★ 只信哈希：Gitee 附件实测出现过"截断后仍是合法 PE 头"的同款问题，没有哈希就不装。
 #: ★ 改这里 = 换发布件，必须同步：客户端 exe_fetch.rs 的登记值、NOTICE、README 资产表。
 DRIVER_URL_DEFAULT = (
-    "https://gitee.com/pan-wenda/douyin/releases/download/v0.2.1/"
+    "https://gitee.com/pan-wenda/douyin/releases/download/v0.3.0/"
     "douyin-browser-driver-win64-patchright-1.58.2.zip"
 )
 DRIVER_SHA_DEFAULT = "8a6de597f21574094d93ee86a1e965330fae32b29aaec458385abd5ae880b03d"

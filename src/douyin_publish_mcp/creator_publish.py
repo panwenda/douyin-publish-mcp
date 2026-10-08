@@ -302,7 +302,11 @@ async def _publish(spec: Dict[str, Any], note: bool) -> Dict[str, Any]:
             product_title = str(data.get("product_title") or "")
             if bool(link) != bool(product_title):
                 raise PublishAbort("带货商品要链接和短标题**一起**给（只给一个平台不认）。")
-            check_titles(str(data.get("title") or ""), str(data.get("description") or ""),
+            # ★ 与图文分支一样要把 title 落到本地变量：下面填表单时要用它。
+            #   （原来只在图文分支赋值，视频分支一进来就 UnboundLocalError ——
+            #    那是"预检能过、一填标题就崩"，最靠近发布的一步才炸。）
+            title = str(data.get("title") or "")
+            check_titles(title, str(data.get("description") or ""),
                           list(data.get("tags") or []))
             schedule = normalize_schedule(str(data.get("schedule") or ""))
     except PublishAbort as exc:

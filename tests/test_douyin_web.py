@@ -227,6 +227,38 @@ class RequestCase(unittest.TestCase):
         self.assertIn("代理", ctx.exception.hint)
 
 
+class WebErrorAttrsCase(unittest.TestCase):
+    """`DouyinWebError` 的属性契约。
+
+    ★ 为什么单独钉：`account.check_account()` 在两条**正常**的失败分支里拼提示文案时
+      写的是 `exc.message`。而这个类只把 message 交给了 `super().__init__()`，自己没留
+      一份 —— 于是"凭据失效"与"被风控挡住"这两个本该给用户一句有用提示（下一步重新扫码）
+      的分支，会在拼字符串时抛 `AttributeError`，把可读提示变成一个内部错误。
+      实测踩到，故钉住 `message` 必须是一个真属性。
+    """
+
+    def test_异常对象带_message_属性(self):
+        exc = DouyinWebError("凭据里的登录标识已失效", kind="no_credential", hint="重新扫码")
+        self.assertEqual(exc.message, "凭据里的登录标识已失效")
+        # str(exc) 与 .message 必须一致（调用方可能用任一边拼文案）
+        self.assertEqual(str(exc), exc.message)
+
+    def test_各_kind_都能用_message_拼文案(self):
+        """把 account.py 里那两句拼接原样跑一遍：不许抛 AttributeError。"""
+        for kind, msg in (
+            ("no_credential", "凭据里的登录标识已失效"),
+            ("blocked", "抖音返回 403 Blocked by ArgusSecurityPlugin"),
+            ("network", "网络不通"),
+        ):
+            exc = DouyinWebError(msg, kind=kind)
+            try:
+                # 对应 account.py:82 / :90 的用法
+                _ = "（%s）%s" % (exc.message, "detail")
+                _ = "（%s：%s）" % (exc.kind, exc.message)
+            except AttributeError as err:  # pragma: no cover
+                self.fail("kind=%s 时拼文案抛了 %s" % (kind, err))
+
+
 class PickCase(unittest.TestCase):
     def test_搜索结果的_aweme_info_包裹能解开(self):
         item = {

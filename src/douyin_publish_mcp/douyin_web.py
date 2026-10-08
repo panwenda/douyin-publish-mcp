@@ -12,7 +12,7 @@
 
 ## 与本服务其它部分的关系
 
-- 凭据：`douyin_cred.resolve_credential`（与发布共用 sau 的 storage_state）；
+- 凭据：`douyin_cred.resolve_credential`（与发布共用同一份 storage_state）；
 - 门禁：本模块**只读**。写操作（评论/点赞/收藏）不在这里 —— 那些必须过
   `server.py` 的 confirm 门禁，所以它们出现在第二批工具里，而不是这里随手加一个 POST。
 
@@ -94,6 +94,11 @@ class DouyinWebError(Exception):
     #: kind 取值：no_credential / not_login / blocked / network / upstream / parse
     def __init__(self, message: str, kind: str = "network", hint: str = ""):
         super().__init__(message)
+        # ★ 必须留一份 `message`:虽然 `str(exc)` 也能拿到,但调用方(如 account.py)
+        #   写的是 `exc.message` —— 只在 __init__ 里丢掉这个属性,就会让"探针失败的
+        #   正常分支"在拼提示文案时抛 AttributeError,把一句有用的"下一步:重新扫码"
+        #   变成一个内部错误(实测踩到)。
+        self.message = message
         self.kind = kind
         self.hint = hint
 
@@ -185,7 +190,7 @@ class DouyinWebClient:
                 kind="no_credential",
                 hint=(
                     "读取需要登录态。请先调用 douyin_account_login（account=\"<账号名>\"）"
-                    "让用户扫码；凭据由 social-auto-upload 写进项目目录的 cookies/ 后本工具即可用。"
+                    "让用户扫码；凭据写进本服务的数据目录后本工具即可用。"
                 ),
             )
         if not self.cred.has_login and not self.cred.has_device:

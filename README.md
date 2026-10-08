@@ -1,18 +1,20 @@
 # douyin-publish-mcp
 
-把 [social-auto-upload](https://github.com/dreammis/social-auto-upload)（MIT）的**抖音发布能力**
-包成薄 MCP 服务，供本平台的「MCP 商店」安装、启停用。发布之外还带一套**读取**工具
-（搜索 / 作品详情 / 用户主页 / 我的主页 / 分享链接解析），登录态与发布共用同一份，
-见「[读取能力怎么来](#读取能力怎么来与小红书-mcp-的差别)」。
+把抖音的**发布 + 读取**能力包成薄 MCP 服务，供本平台的「MCP 商店」安装、启停用。
+发布/登录/账号检查是**本服务自带**的创作者中心自动化（选择器与流程知识参考了
+[social-auto-upload](https://github.com/dreammis/social-auto-upload)（MIT，见 NOTICE 署名）），
+运行时**不再调用外部 CLI**；读取则直连抖音 web 接口，见
+「[读取能力怎么来](#读取能力怎么来三条通道逐级回退)」。
 
 - **10 个工具**：账号状态、扫码登录（会话式）、重置登录态、发布视频、发布图文；
   搜索视频、作品详情、用户主页、我的主页、分享链接解析。
-- **零三方依赖**：只用 Python 标准库（协议层与读取通道都自己写，见下）。
+- **零三方依赖**：只用 Python 标准库（协议层与读取通道都自己写，见下）；
+  浏览器驱动按需取、浏览器用系统 Chrome —— exe 因此能保持小。
 - **发布是两步**：预检（不碰账号）→ 用户确认 → 执行（见「发布门禁」）；
   读取**不**吃 confirm —— 它只看、不动账号，所以不值得多一次往返。
 - **两种形态**：`stdio`（默认，宿主起子进程）与 `streamable_http`（本机常驻 + 状态页）。
 
-它不重写任何平台逻辑：**发布**动作仍由 `sau` CLI 做，这一层只做四件事 ——
+它不重写任何平台逻辑，这一层只做四件事 ——
 **参数构造、素材白名单、协议适配、确认门禁**；**读取**则由本服务直连抖音 web 接口
 （带上用户登录 cookie），把上游几十 KB 的响应裁成几句人真正会看的字段。
 
@@ -47,85 +49,70 @@
 
 ---
 
-## 前置：把 social-auto-upload 跑起来（**每台要用它的机器都要做一遍**）
+## 前置：装个浏览器就行（**不再需要 social-auto-upload**）
 
-sau **不在本包里**：本服务是个薄壳，运行时调的是你机器上的 `sau` 命令。
-所以下面这 4 步不是"部署者做一次"，而是**每个用户在自己的机器上各做一遍**
-（登录态更是天然按人、按账号分开的）。
+v0.3.0 起登录 / 账号检查 / 发布**全部自带**（就放在本包里，跑在 `--creator-helper` 子进程里），
+所以"先用另一个项目把 sau 装起来、再配两个环境变量"这一步没有了。
+运行时要的只有：
 
-```bash
-git clone https://github.com/dreammis/social-auto-upload.git
-cd social-auto-upload
-uv sync
-uv pip install -e .                      # 生成 sau 命令入口
-cp conf.example.py conf.py               # ★ 必须做：sau_cli.py 第一行就是 from conf import BASE_DIR
-patchright install chromium              # 浏览器运行时（约 150MB，装一次）
-uv run sau douyin login --account main   # 先手动登录一次，确认整条链路通
-```
+- **一个 Google Chrome**（或 msedge）。默认 `channel=chrome`；
+  用 `DOUYIN_CREATOR_CHANNEL` 可换成 `msedge`。不带 Chromium ——
+  patchright 自带那份要另下约 170MB，与"exe 保持小"冲突。
+- **浏览器驱动**（patchright）。**不进 exe**，首次用到时按需取（见
+  「[浏览器通道的依赖怎么来](#浏览器通道的依赖怎么来exe-保持小--按需取驱动)」）；
+  内网机器可用 `DOUYIN_BROWSER_DRIVER_ARCHIVE` 预置本地 zip。
+- **登录一次**：调 `douyin_account_login` 扫码（弹真窗口，扫完自动关），
+  凭据落在本服务自己的数据目录（`%LOCALAPPDATA%\douyin-publish-mcp\data\`）——
+  不再依赖别人的 `cookies/` 目录。
 
-几个容易踩的点：
-
-- **`conf.py` 不在仓库里**（要从 `conf.example.py` 复制），漏了这步 sau 会直接 `ImportError`；
-  而且 `BASE_DIR = conf.py 所在目录`，**不能用环境变量覆盖** —— 所以 `cookies/` 就落在
-  clone 下来的那个目录里，凭据位置才可预期。
-  ⚠️ 反过来：若 sau 是从内网 PyPI / 归档**装成包**（非 editable），`BASE_DIR` 会变成包安装目录，
-  `cookies/` 就写进缓存里（会被清理、也不好备份）—— 这也是本服务主推 `SAU_DIR` / `SAU_CMD` 的原因。
-- **`uv` 要是能用的**：本服务是用 `uv run --directory <SAU_DIR>` 拉起 sau 的。客户端内置的 uv
-  只用于把商店条目里 `command=uvx` 换成本机内嵌版本，**不会**替我们 spawn 的 `uv run` 兜底 ——
-  所以机器上要么有 `uv`，要么把 `SAU_UV` 写成 uv.exe 的绝对路径（不如直接用 `SAU_CMD` 稳）。
-- **Chromium 是独立一步**：`uv pip install -e .` 不会装它。`conf.py` 里的 `LOCAL_CHROME_PATH`
-  可以指向系统已装的 Chrome（能否省掉那份 150MB 下载待实测）。
-- Windows 上装 Chromium 建议先设镜像：
-  `$env:PLAYWRIGHT_DOWNLOAD_HOST="https://npmmirror.com/mirrors/playwright"`
-
-> 想让"其他用户零手工"，只能靠三件事之一：① 把上面这些做成一个可复制的安装脚本/引导
-> （商店目前没有"安装后执行 prepare 命令"的能力）；② 把 sau 环境 + Chromium 一起预置分发；
-> ③ 集中部署一台机器走 http 形态给别人连（但凭据与账号归属都在那台机器上，只适合共享账号的场景）。
+> 旧版本把"发什么"交给机器上的 `sau` 命令，于是可用性等于别人项目的可用性。
+> 现在这条路去掉了，代价是本包自己承担自动化流程的维护（选择器改版要跟着改）。
 
 ---
 
 ## 配置（环境变量）
 
 由商店安装时填的 `envVars` 提供；也可以在 MCP 配置页补填/修改。
+★ v0.3.0 起统一 `DOUYIN_` 前缀，**`SAU_*` 全部作废**。
 
 | 变量 | 必填 | 说明 |
 | --- | --- | --- |
-| `SAU_CMD` | 二选一 | `sau` 可执行文件**绝对路径**（最稳），如 `%USERPROFILE%\.local\bin\sau.exe` |
-| `SAU_DIR` | 二选一 | social-auto-upload 项目根目录 → 用 `uv run --directory <dir> sau` 调起 |
-| `SAU_MEDIA_DIR` | 发布必填 | **允许发布的素材根目录**（默认取 `SAU_DIR`）。给的素材路径必须落在它里面 |
-| `SAU_TIMEOUT` | 否 | 单次调用超时秒数，默认 900（上传慢，别调太小） |
-| `SAU_HEADLESS` | 否 | `1`（默认）无头 / `0` 有头 —— **只管发布**；登录由工具的 `headed` 参数控制，**默认 true 弹真窗口** |
-| `SAU_UV` | 否 | uv 可执行文件路径（默认 `uv`） |
-| `SAU_NO_SYNC` | 否 | `1` = `uv run --no-sync`（更快，但要求事先 `uv sync` 过） |
-| `SAU_VERIFY_CODE_FILE` | 否 | 短信验证码文件，默认 `<SAU_DIR>/verify_code.txt` |
-| `SAU_ACCOUNT` | 否 | 读取工具的默认账号名（默认 `main`）；状态页也用它做预填 |
-| `DOUYIN_COOKIE_FILE` | 否 | 读取用的凭据文件（storage_state 或裸 Cookie 串）。**不填就用 sau 的凭据文件** |
-| `DOUYIN_COOKIE` | 否 | 直接给整串 cookie（容器 / 临时调试用）。与上一行二选一，显式配置优先 |
+| `DOUYIN_MEDIA_DIR` | 发布必填 | **允许发布的素材根目录**（唯一路径闸门）。给的素材路径必须落在它里面 |
+| `DOUYIN_ACCOUNT` | 否 | 默认账号名（默认 `main`）；凭据文件名里用它 |
+| `DOUYIN_TIMEOUT` | 否 | 单次调用超时秒数，默认 900（上传慢，别调太小） |
+| `DOUYIN_PUBLISH_HEADLESS` | 否 | `1`（默认）无头 / `0` 有头 —— **只管发布**；登录**始终有头**（抖音会挑无头，且可能要输短信验证码） |
+| `DOUYIN_CREATOR_CHANNEL` | 否 | 创作者中心自动化的浏览器通道，默认 `chrome`（可 `msedge`） |
+| `DOUYIN_VERIFY_CODE_FILE` | 否 | 短信二次验证的验证码文件，默认 `<数据目录>/verify_code.txt` |
+| `DOUYIN_DATA_DIR` | 否 | 凭据/二维码/验证码文件的数据目录，默认 `%LOCALAPPDATA%\douyin-publish-mcp\data` |
+| `DOUYIN_DEBUG` | 否 | `1` = 失败时截图留档 |
+| `DOUYIN_COOKIE_FILE` | 否 | 显式指定凭据文件（storage_state 或裸 Cookie 串）。**不填就用数据目录里的 `<账号>` 那份** |
+| `DOUYIN_COOKIE` | 否 | 直接给整串 cookie（容器 / 临时调试用，**只能用于读取**：发布需要完整 storage_state 文件） |
 | `AUTH_TOKEN` | HTTP 形态可选 | 填了就要求 `Authorization: Bearer <token>`；**绑定非本机地址时必填** |
 
-`SAU_MEDIA_DIR` 没配时**所有发布工具都会拒绝执行**并说明怎么配 ——
+`DOUYIN_MEDIA_DIR` 没配时**所有发布工具都会拒绝执行**并说明怎么配 ——
 这是刻意的：宁可报"没配置"，也不能退化成"整个磁盘可读"。
 
-### 只读取、不装 social-auto-upload 行吗？
+### 只不装浏览器 / 只想读取行吗？
 
-**行，但得自己给一份 cookie。** 实测（Windows，v0.2.1，环境里 `SAU_*` 一个都不配）：
+**行 —— 读取不依赖浏览器自动化。** 实测（Windows，本机，2026-10-08 实测）：
 
-| 能力 | 不装 sau | 说明 |
+| 能力 | 需要什么 | 说明 |
 | --- | --- | --- |
-| 服务启动 / `/health` / HTTP 端点 | ✅ | 起得来，启动日志里写着 `SAU_CMD=(未设置)` |
-| 读取 5 个工具 | ✅ **需要 cookie** | 设 `DOUYIN_COOKIE_FILE`（或 `DOUYIN_COOKIE`）；实测 8.5 秒拿到作品详情与无水印直链、1.3 秒搜到 3 条 |
-| 浏览器通道（详情 / 用户作品 / 评论） | ✅ | 驱动按需自取、浏览器用系统 Chrome，都不依赖 sau |
-| 发布 5 个工具 | ❌ | 真实动作由 `sau` CLI 完成 |
-| 扫码登录 / 账号检查 | ❌ | 同样走 `sau`（`sau douyin check`，扫码用它的 `douyin_cookie_gen`） |
+| 服务启动 / `/health` / HTTP 端点 | 只要 Python | 起得来 |
+| 读取 5 个工具 | **一份 cookie** | 设 `DOUYIN_COOKIE_FILE`（或 `DOUYIN_COOKIE`）；实测直连 1.2 秒搜到 3 条、0.4 秒拿到"我的资料" |
+| 浏览器通道（详情 / 用户作品 / 评论） | 驱动 + Chrome | 驱动按需自取、浏览器用系统 Chrome |
+| 扫码登录 / 账号检查 | 自带自动化 + Chrome | 登录要真窗口；登录态检查是**直连探针**，不开浏览器 |
+| 发布 5 个工具 | 上面全部 + 素材目录 | 需要完整 storage_state 文件（只给裸 cookie 不够） |
 
 两点代价，先想清楚再走这条路：
 
 1. **cookie 会过期** —— 过期后读取报 `no_credential` / `blocked`，得重新导出一份。
-   长期用还是装 sau 更省事（它能扫码续期），这条路适合"导一次、只读一阵子"。
+   长期用还是走 `douyin_account_login` 扫码更省事（能续期），
+   这条路适合"导一次、只读一阵子"。
 2. 凭据**两种格式都认**：浏览器 DevTools 里复制的整串 Cookie，或 patchright / Playwright
    的 `storage_state` JSON。给了文件就优先用它 —— 环境里的残留文件不会盖掉你明确指定的那个。
 
-> 商店条目里 `envVars` 故意留空也是同一个原因：`SAU_*` 与 cookie 路径都是**机器相关**的，
+> 商店条目里 `envVars` 故意留空也是同一个原因：素材目录与 cookie 路径都是**机器相关**的，
 > 猜一个写死进去，错了就是"装完直接报找不到文件"，比留空更难排查。
 
 ---
@@ -134,7 +121,7 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 
 | 工具 | 作用 | 模型该怎么用 |
 | --- | --- | --- |
-| `douyin_account_status(account)` | 查登录态 | 判据是 `sau douyin check` 的**退出码**（0=valid / 1=invalid），文本兜底；未登录会提示去登录 |
+| `douyin_account_status(account)` | 查登录态 | 判据是**直连探针** `/aweme/v1/web/user/profile/self/`（能拿到自己的资料就是有效）；被风控挡住时如实说「判不出来」，**不猜**"没登录" |
 | `douyin_account_login(account, headed=true, wait_seconds=90)` | 扫码登录（**会话式**） | 弹**真窗口**（抖音会挑无头浏览器，且可能要输短信验证码），二维码同时以图片返回；**扫完窗口自动关闭**（没人扫也最多 2 分钟）；调用等一段就返回状态，还在等就**再调一次**继续查（不会另开会话）；扫完自动检查一次 |
 | `douyin_account_logout(account, confirm=false)` | 重置登录态 | ★ 两步：先回报"将要删除的凭据文件"，用户同意后才 `confirm=true` |
 | `douyin_publish_video(account, file, title, description?, tags?, schedule?, thumbnail_portrait?, thumbnail_landscape?, product_link?, product_title?, declaration?, collection?, plan_id?, confirm?)` | 发布视频 | 先不传 confirm 拿计划 → 念给用户 → 带 `plan_id`+`confirm=true` 再调 |
@@ -145,14 +132,14 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 | `douyin_my_profile(include_videos?, limit?, account?)` | 当前登录账号自己的主页 | 回答「我这个号发了多少、粉丝多少」用它，不用传 id |
 | `douyin_parse_share_link(share_text, account?)` | 分享文本 → 作品详情 | 用户贴「…复制打开抖音… https://v.douyin.com/xxxx/」时用它；链接过期或给的是主页/合集链接，会说明原因而不是静默失败 |
 
-读取工具的 `account` 都可以省略（默认 `SAU_ACCOUNT`，兜底 `main`）。
+读取工具的 `account` 都可以省略（默认 `DOUYIN_ACCOUNT`，兜底 `main`）。
 `download_url` 是**有时效**的直链（通常几小时），要保存就当场下载；本服务只返回地址，**不落盘**。
 
 `schedule` 传本地时间 `'2026-03-24 21:30'` 即走定时发布；不传 = 立即发布。
 
-### 与 sau CLI 的开关对齐（这些不是"锦上添花"）
+### 发布参数（这些不是"锦上添花"）
 
-工具参数覆盖 CLI **真实支持**的开关（见 `sau_cli.py` 的 `douyin` 子命令定义）：
+工具参数覆盖创作者中心**真实支持**的开关：
 
 | 场景 | 参数 | 少了的后果 |
 | --- | --- | --- |
@@ -160,26 +147,25 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 | 带货 | `product_link` + `product_title`（**必须成对**，构造阶段就拦） | 商品没挂上，白发了 |
 | 自主声明 | `declaration`（要平台给的原样文案） | 该声明的没声明，合规风险 |
 | 合集 | `collection`（合集必须已存在） | 作品没进合集，播放路径少一条 |
-| 长正文/背景音乐 | `note_file`→`--notef` / `bgm`（搜索词，非路径） | 正文只能塞在参数里，容易截断 |
+| 长正文/背景音乐 | `note_file`→从文件读正文 / `bgm`（搜索词，非路径） | 正文只能塞在参数里，容易截断 |
 
 > 封面与 `note_file` 同样是**把本机文件交给平台**，所以都走素材目录白名单。
 
 ### 登录为什么是"会话"而不是一次调用
 
-`sau douyin login` 会一直等到用户扫完码（几十秒到几分钟）。若当成同步调用，会把客户端卡住，
+扫码登录会一直等到用户扫完码（几十秒到几分钟）。若当成同步调用，会把客户端卡住，
 而且中断后没有任何地方能回答"刚才那次登录怎么了"。所以：
 
 - 同一时刻**只保留一个待扫码会话**（开新的会关掉旧的，否则每点一次多一个浏览器）；
 - 会话状态（等待中/结束/输出/二维码）留在进程里，工具与状态页读的是**同一份**；
-- 登录流程结束后**自动**跑一次 `check`：`login` 退出码 0 ≠ 扫上了，用户关心的是后者；
-- 等待扫码期间**不做** `check`（那时已有一个浏览器，再起一个既慢又容易让用户误以为"检查结果是没登录"）。
+- 登录流程结束后**自动**跑一次检查：流程走完 ≠ 扫上了，用户关心的是后者；
+- 等待扫码期间**不做**检查（那时已有一个浏览器，再起一个既慢又容易让用户误以为"检查结果是没登录"）。
 
 ### 重置登录态（唯一的删除操作）
 
-- sau **没有** `logout` 子命令（抖音只有 login / check / upload-video / upload-note），
-  所以"退出登录"在这条链路上就是删掉凭据文件：`<项目>/cookies/douyin_<账号>.json`。
-- 只删这一个文件：不递归、不删目录、不碰其它账号；路径再做一次"父目录必须是 cookies/、
-  文件名必须严格匹配"的校验；`confirm=false` 时只看不删。
+- 这条链路上"退出登录"就是删掉凭据文件：
+  `<数据目录>/douyin_<账号>.json`（`DOUYIN_COOKIE_FILE` 显式指定的那份则删它）。
+- 只删这一个文件：不递归、不删目录、不碰其它账号；`confirm=false` 时只看不删。
 
 ### 发布门禁（本服务最要紧的一条）
 
@@ -237,7 +223,7 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 
 | 来源 | 怎么配 | 说明 |
 | --- | --- | --- |
-| 本机已有 | `DOUYIN_BROWSER_SITE_PACKAGES=<site-packages>` | 例如 social-auto-upload 的 `.venv\Lib\site-packages` |
+| 本机已有 | `DOUYIN_BROWSER_SITE_PACKAGES=<site-packages>` | 例如本机某个装了 patchright 的 venv 的 `.venv\Lib\site-packages` |
 | 运行时目录 | 默认 `%LOCALAPPDATA%\douyin-publish-mcp\browser-runtime\site-packages` | 下面两种方式都落到这里，之后就不再重复取 |
 | 本地归档 | `DOUYIN_BROWSER_DRIVER_ARCHIVE=<zip>` | 离线/内网预置：zip 内含 `patchright/` 目录 |
 | 发布源 | 默认已内置（Gitee 附件 `douyin-browser-driver-win64-patchright-1.58.2.zip` + 哈希）；`DOUYIN_BROWSER_DRIVER_URL` / `DOUYIN_BROWSER_DRIVER_SHA256` 可覆盖 | **只信哈希**：不匹配就拒装（截断过的来源是真实踩过的坑） |
@@ -264,32 +250,44 @@ uv run sau douyin login --account main   # 先手动登录一次，确认整条�
 
 | 段 | 环节 | 需要什么 |
 | --- | --- | --- |
-| 本地 | 单测 → 协议层 → 发布门禁 → HTTP 形态 | 只要 Python。**不联网、不跑 sau、不碰账号** |
-| 真机 | 环境前置 → 登录态 → 读取五连 → 发布预检 | sau + 登录态 + 外网 |
+| 本地 | 单测 → 协议层 → 发布门禁 → HTTP 形态 | 只要 Python。**不联网、不起 helper、不碰账号** |
+| 真机 | 环境前置 → 登录态 → 读取五连 → 浏览器通道 → 发布预检 | 登录态 + 外网 + Chrome（驱动按需取） |
 
 ```powershell
 cd E:\项目\AI\douyin-publish-mcp
 $env:PYTHONPATH="src"
 & ..\.venv\Scripts\python.exe scripts\verify_flow.py --local-only   # 只有 Python 就够
 & ..\.venv\Scripts\python.exe scripts\verify_flow.py                # 本地段 + 真机段
-& ..\.venv\Scripts\python.exe scripts\verify_flow.py --keyword 猫 --publish-file D:\media\a.mp4
+& ..\.venv\Scripts\python.exe scripts\verify_flow.py --keyword 猫 --publish-file a.mp4
+```
+
+真机段要的 `DOUYIN_*` 按现场给（例如复用一份已有 cookie）：
+
+```powershell
+$env:DOUYIN_COOKIE_FILE="<凭据 json 的绝对路径>"   # 不设就用数据目录里扫码存下的那份
+$env:DOUYIN_MEDIA_DIR="<素材目录绝对路径>"
 ```
 
 脚本走的是和客户端**完全相同**的 `Server.handle` 路径（不是另写一套调用），每步给
 `PASS` / `FAIL` / `SKIP`：
 
 - **本地段**：全部单测；协议握手与 10 个工具的 schema；**发布门禁**（预检只出计划，
-  `plan_id` 不符与内容改过都必须被拒，并断言全程 **0 次 CLI 调用**）；**HTTP 形态**
+  `plan_id` 不符与内容改过都必须被拒，并断言全程 **0 个 helper 进程**）；**HTTP 形态**
   （真起服务、真发请求：`/health` 免鉴权、无 token 401、状态页有「读取通道」行、
-  无凭据时读取工具给的是可读提示而不是空结果）。
-- **真机段**：登录态（真跑 `sau douyin check`）；**读取五连**（搜索 → 详情 → 用户主页
+  无凭据时读取工具给的是可读提示而不是空结果 —— 这个用例会**自己清干净凭据环境**，
+  免得被真机段设的 `DOUYIN_COOKIE_FILE` 串味）。
+- **真机段**：登录态（直连探针）；**读取五连**（搜索 → 详情 → 用户主页
   → 我的主页 → 分享解析，后三步用前一步真拿到的 `aweme_id` / `sec_user_id` 串起来）；
-  发布预检（用你自己的素材）。
+  **浏览器通道**（单独验详情 + 评论）；发布预检（用你自己的素材）。
 
 - **默认不发布任何东西**：发布只跑到"预检 + 门禁必须拦住"。要真发得显式加 `--confirm-publish`。
 - **SKIP 不等于通过**：脚本最后会单独列出"还没验过的"。本地段全绿只说明**服务的壳是对的**，
   不说明抖音认它 —— 判决点是真机段的「搜索」那一步。
 - 退出码：`0` = 没有 FAIL（可以带 SKIP）；`1` = 有 FAIL。
+
+> **实测留痕（2026-10-08，本机）**：本地段 4 PASS / 0 FAIL；带 `DOUYIN_COOKIE_FILE` +
+  `DOUYIN_MEDIA_DIR` 跑完整两段 = **13 PASS / 0 FAIL / 1 SKIP**（唯一 SKIP 是"真发"，
+> 因为没加 `--confirm-publish`）。读取走**直连**通道，浏览器通道 17~19 秒拿到详情 + 评论。
 
 ### 没有脚本时的手动版（等价，按顺序来）
 
@@ -367,7 +365,7 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ```powershell
 & "$env:LOCALAPPDATA\douyin-publish-mcp\douyin-publish-mcp.exe" --http --port 18080
-# /health → {"status":"ok","service":"douyin-publish-mcp","version":"0.2.1"}
+# /health → {"status":"ok","service":"douyin-publish-mcp","version":"0.3.0"}
 # POST /mcp tools/list → 10 个工具
 ```
 
@@ -375,7 +373,7 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 | | onedir（默认） | onefile（Release 资产用这个） |
 | --- | --- | --- |
-| 产物 | 一个目录（含 `_internal`） | 单个 exe（约 9 MB） |
+| 产物 | 一个目录（含 `_internal`，全目录约 22.6 MB） | 单个 exe（约 10.9 MB） |
 | 分发 | 整目录拷过去 | 只拷一个文件 |
 | 启动 | 快（约 1s） | 首次多几百 ms（自解压） |
 | 停用能否收干净 | 单进程，按台账直接收 | ★ **会留下一层同名子进程**（自解压的 bootloader），父进程被杀后它可能仍在监听端口 —— 靠客户端的**端口归属兜底**（映像名 == 配置的 exe 名）收掉 |
@@ -387,11 +385,11 @@ curl -X POST http://127.0.0.1:18080/mcp -H "Content-Type: application/json" \
 
 ## 从 Release 安装（使用者）
 
-发布源（Gitee 镜像，本公司账号）：**https://gitee.com/pan-wenda/douyin**（当前 v0.2.1）
+发布源（Gitee 镜像，本公司账号）：**https://gitee.com/pan-wenda/douyin**（当前 v0.3.0）
 
 | 资产 | 用途 |
 | --- | --- |
-| `douyin-publish-mcp.exe` | 服务本体：PyInstaller **onefile** 单文件，约 10.8 MB，**自带 Python 运行时，不用先装 Python** |
+| `douyin-publish-mcp.exe` | 服务本体：PyInstaller **onefile** 单文件，约 10.9 MB（11,440,439 字节），**自带 Python 运行时，不用先装 Python** |
 | `douyin-publish-mcp-win64-onedir.zip` | 整包形态（解压即用；onedir 少一层自解压子进程，停用时更好收） |
 | `douyin-browser-driver-win64-patchright-1.58.2.zip` | 浏览器驱动（**不用手动下**：真缺时服务自己按需取，见下面「浏览器通道」一节） |
 
@@ -406,9 +404,9 @@ Move-Item .\douyin-publish-mcp.exe "$dst\douyin-publish-mcp.exe" -Force
 `%LOCALAPPDATA%\douyin-publish-mcp\douyin-publish-mcp.exe` —— 形态与商店里的小红书 MCP 一致
 （`%LOCALAPPDATA%\<服务名>\<服务名>.exe`，客户端 `expand_env` 会展开这个占位）。
 
-> ★ **但 exe 不是全部**：它自带 Python 运行时，却**不自带 `sau`** —— 真正的发布/登录动作仍由
-> 本机的 [social-auto-upload](https://github.com/dreammis/social-auto-upload) 完成。
-> 装完 exe 还要装 `sau` 并配 `SAU_CMD`/`SAU_DIR`/`SAU_MEDIA_DIR`，见下面的前置条件。
+> ★ **但 exe 不是全部**：它自带 Python 运行时、自带发布/登录自动化，却**不自带浏览器驱动**
+> （patchright 那 ~100MB）与浏览器 —— 驱动首次用到时按需取，浏览器用系统 Chrome。
+> 装完 exe 还要配 `DOUYIN_MEDIA_DIR`（发布必填，素材闸门），见上面的前置条件。
 
 ---
 
@@ -461,12 +459,12 @@ python -m douyin_publish_mcp --http --port 18080
 
 | 表单字段 | http 形态（[`store_config.json`](store_config.json)） | stdio 形态（[`store_config.stdio.json`](store_config.stdio.json)） |
 | --- | --- | --- |
-| 名称 | 抖音发布与读取（social-auto-upload） | 同（·stdio） |
+| 名称 | 抖音发布与读取 | 同（·stdio） |
 | 传输方式 | `streamable_http` | `stdio` |
 | command | `%LOCALAPPDATA%\douyin-publish-mcp\douyin-publish-mcp.exe` | `uvx` |
 | args | `--http --port 18080` | `--from <内网包来源> douyin-publish-mcp` |
 | url | `http://127.0.0.1:18080/mcp` | （空） |
-| envVars | SAU_CMD / SAU_DIR / SAU_MEDIA_DIR / SAU_TIMEOUT / SAU_ACCOUNT / AUTH_TOKEN | 同左，**无** AUTH_TOKEN |
+| envVars | `DOUYIN_MEDIA_DIR` / `DOUYIN_ACCOUNT` / `DOUYIN_TIMEOUT` / `AUTH_TOKEN` | 同左，**无** AUTH_TOKEN |
 | status / visibility | `2` / `public` 才会出现在商店里给所有人装 | 同左 |
 
 - 走 `POST /api/mcp-service-config` 落库 `tb_mcp_service_config`。
@@ -474,7 +472,8 @@ python -m douyin_publish_mcp --http --port 18080
 - 发布前先跑一遍 `scripts/verify_flow.py --local-only`：确认 `tools/list` 里正好 10 个工具、
   描述完整、发布门禁拦得住 —— 商店里装的版本和这份配置是同一个东西，别把没验过的发出去。
 - 读取工具用到的 `DOUYIN_COOKIE_FILE` / `DOUYIN_COOKIE`（见环境变量表）**不放进**商店默认：
-  正常路径下凭据来自 `SAU_DIR`，这两个只在"读取和发布不是一个账号/项目"时才需要，属高级用法。
+  正常路径下凭据来自本服务数据目录（扫码登录时写下的那份），这两个只在
+  "读取和发布不是一个账号/换机器复用凭据"时才需要，属高级用法。
 
 ### 3. 安装后的行为差异（这段决定运维怎么做）
 
@@ -486,7 +485,9 @@ python -m douyin_publish_mcp --http --port 18080
 
 ### 4. 换机器/换目录
 
-改 MCP 配置页里的 env（`SAU_CMD`/`SAU_DIR`/`SAU_MEDIA_DIR`）再重启该服务即可，不用重装。
+改 MCP 配置页里的 env（`DOUYIN_MEDIA_DIR` / `DOUYIN_ACCOUNT`）再重启该服务即可，不用重装。
+凭据默认落在该机器的 `%LOCALAPPDATA%\douyin-publish-mcp\data\`，**换机器要重新扫码**；
+想复用旧机器的登录态，把那份 json 拷过去并用 `DOUYIN_COOKIE_FILE` 指过去。
 
 ---
 
@@ -494,14 +495,16 @@ python -m douyin_publish_mcp --http --port 18080
 
 - 底层是**浏览器自动化 + 用户自己的登录态**：违反抖音平台协议，随时可能被改版/风控打断。
   真要长期稳定，走开放平台 `video.create`（合规但需资质与用户授权）。
-- 本服务**不存储**账号密码，但它依赖的 `sau` 会在项目目录里保存 cookie/浏览器资料 ——
+- 本服务**不存储**账号密码，但登录态（cookie / storage_state）会落在本机数据目录里 ——
   那是**凭据**，不要提交进任何仓库。★ 读取通道**必须读到 cookie 的值**（否则发不出请求），
   但对外只回显**来源与 cookie 名**：工具输出、状态页、日志里都不会出现值。
-  「重置登录态」是唯一的删除动作，且只删 `<项目>/cookies/douyin_<账号>.json` 一个文件。
+  「重置登录态」是唯一的删除动作，且只删 `<数据目录>/douyin_<账号>.json` 一个文件。
 - 读取工具会把**公开内容与你自己的账号资料**带进对话上下文（含无水印直链，几小时后失效）。
   只用它读公开内容与自己有权看的账号；把 `limit` 调大、连续多次搜索会显著提高被风控的概率。
 - http 形态默认只绑 `127.0.0.1`；改绑别处必须配 token —— 这个服务能直接发布内容。
-- 每次发布都会真实落到用户账号上；"命令成功"不等于"已公开可见"（平台还有审核）。
+- 每次发布都会真实落到用户账号上；"提交成功"不等于"已公开可见"（平台还有审核）。
+  ★ 点过「发布」但没等到成功页 → `state=uncertain`，这时**绝不自动重试**（重试就可能发两条），
+  必须让人去创作者中心「作品管理」核对。
 - 短视频平台的标题/正文/图片数量限制会变，本服务里的长度预检（标题 30 字、正文 1000 字）
   只用于**尽早报错**，不代表平台真实限额。
 
