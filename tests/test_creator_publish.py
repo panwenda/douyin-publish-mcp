@@ -193,6 +193,8 @@ class TestVideoBranchUsesTitle(unittest.TestCase):
 
         async def fake_fill_title(page, title, description, tags):
             seen["title"] = title
+            seen["description"] = description
+            seen["tags"] = list(tags or [])
 
         # ★ 必须把 patchright 也桩掉：`_publish` 是**函数内** import 它的
         #   （刻意如此：参数/凭据的问题不该被"没装驱动"盖住）。测试环境没有驱动，
@@ -237,6 +239,54 @@ class TestVideoBranchUsesTitle(unittest.TestCase):
         self.assertEqual(seen.get("title"), "周末随拍", "视频分支没有把 title 带到填表那一步")
         # 结果本身是"没点动发布"，但那不是这一步要验的（原来连这一步都到不了）
         self.assertEqual(payload.get("error", {}).get("kind"), "publish_failed")
+
+    def test_视频分支的正文与话题也传到了填表(self):
+        """★★ 正文与话题在**两条分支**上都必须真的送到填表函数。
+
+        背景（2026-10-08）：用户报"发布时正文和话题丢失"，实测结论是**话题**没被
+        抖音认成真话题（`hashtag_id=0`），修在 `creator_steps.fill_title_and_description`
+        —— 那是两条分支**共用**的入口，所以视频分支一并受益（已真机验证：
+        视频页载荷里 3 个话题 `hashtag_id` 与图文页完全一致）。
+
+        ★ 这里钉的是"别让将来某条分支单独开一套填表逻辑"：一旦有人给视频或图文
+        另写一个填表入口，这个修复就会**只对一半分支生效**，而且症状极隐蔽
+        （参数校验全绿、发布也成功，只是话题变成纯文本）。
+        """
+        payload, seen = self._run_video(
+            {
+                "credential_path": str(self.cred),
+                "timeout_sec": 60,
+                "video": {
+                    "path": str(self.root / "a.mp4"),
+                    "title": "周末随拍",
+                    "description": "随手记录",
+                    "tags": ["生活", "日常"],
+                },
+            }
+        )
+        self.assertEqual(seen.get("description"), "随手记录",
+                         "视频分支的正文没送到填表（话题点选修复会失效）")
+        self.assertEqual(seen.get("tags"), ["生活", "日常"],
+                         "视频分支的话题没送到填表（hashtag_id 会退化成 0）")
+
+    def test_两条分支共用同一个填表入口(self):
+        """源码级钉住：`creator_publish` 只 import 一个 `fill_title_and_description`。
+
+        两条分支（视频/图文）都必须在 `_publish` 里汇到**同一个**函数上——
+        话题点选这个修复只住在那里，分叉就会漏。
+        """
+        import inspect
+        import re as _re
+
+        src = inspect.getsource(cp)
+        # 实际**调用点**（`await fill_...(...)`）；import 语句是多行 `from ... import (` 形式，不计入
+        calls = _re.findall(r"await\s+fill_title_and_description\s*\(", src)
+        self.assertEqual(len(calls), 1,
+                         "creator_publish 里出现了多于一个填表调用点，两条分支可能已分叉")
+        # 调用点必须落在 `_publish` 内部（视频/图文唯一的汇合处）
+        body = src[src.index("async def _publish("):]
+        self.assertIn("await fill_title_and_description(", body,
+                      "填表调用必须留在 _publish 里（两条分支的汇合点）")
 
 
 class TestPayloadContract(unittest.TestCase):
@@ -415,6 +465,203 @@ class TestTitleInputSelectors(unittest.TestCase):
             asyncio.run(cs._find_title_input(page, timeout_ms=600))
         self.assertIn("没找到标题输入框", str(ctx.exception))
         self.assertIn("作品标题", str(ctx.exception))
+
+
+class TestMentionPick(unittest.TestCase):
+    """★★ 话题必须**在下拉里点选**才算真话题（回归真实缺陷，2026-10-08）。
+
+    真机抓抖音的提交载荷（`/web/api/media/aweme/create_v2/`）看到：
+    填 ` #音乐节` 之后直接按空格，提交时三个话题的 `hashtag_id` **全是 0**
+    —— 抖音只当它是普通文本，作品页不会变成可点击的话题标签，也就是"话题丢失"。
+    同一个载荷里正文是完整的，所以这不是"没填进去"，而是"填法不对"。
+    下拉框的 class 前缀实测为 `mention-suggest-`（`mention-suggest-mount-dom` /
+    `mention-suggest-item-container-*`），且**按空格的那一瞬间下拉就收起**。
+    """
+
+    def _fake_page(self, *, suggest_visible: bool, item_text: str = "音乐节",
+                   click_result: bool = True):
+        from douyin_publish_mcp import creator_steps as cs
+
+        calls = []
+
+        class FakeItem:
+            def __init__(self, sel):
+                self.sel = sel
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                # ★ 下拉没弹出时**没有候选条目**（不是"容器不可见"）——
+                #   这正是 `_pick_mention` 改成轮询候选条目本身的原因。
+                if "tag-hash-view-name" in self.sel:
+                    return 1 if suggest_visible else 0
+                return 1
+
+            async def inner_text(self, timeout=None):
+                return item_text
+
+            async def scroll_into_view_if_needed(self, timeout=None):
+                return None
+
+            async def bounding_box(self):
+                return None      # 让 native_click 走 locator.click 分支
+
+            async def click(self, timeout=None):
+                calls.append(("click", self.sel))
+                return click_result
+
+        class FakeBox:
+            def __init__(self, sel):
+                self.sel = sel
+
+            @property
+            def first(self):
+                return self
+
+            def locator(self, sel):
+                return FakeItem(sel)
+
+            async def count(self):
+                # 候选条目选择器：下拉没弹出时 count=0（_pick_mention 轮询的就是它）
+                if "tag-hash-view-name" in self.sel:
+                    return 1 if suggest_visible else 0
+                return 1
+
+            async def wait_for(self, state=None, timeout=None):
+                if not suggest_visible:
+                    raise RuntimeError("not visible")
+                return True
+
+            async def inner_text(self, timeout=None):
+                return item_text
+
+            async def scroll_into_view_if_needed(self, timeout=None):
+                return None
+
+            async def bounding_box(self):
+                return None
+
+            async def click(self, timeout=None):
+                calls.append(("click", self.sel))
+                return click_result
+
+        class FakePage:
+            def locator(self, sel):
+                return FakeBox(sel)
+
+            async def wait_for_timeout(self, ms):
+                return None
+
+        return FakePage(), calls, cs
+
+    def test_下拉出现时点选候选(self):
+        """正常路径：下拉可见 → 点第一个候选，返回 True。"""
+        import asyncio
+
+        page, calls, cs = self._fake_page(suggest_visible=True)
+        self.assertTrue(asyncio.run(cs._pick_mention(page, "音乐节")))
+        self.assertTrue(any(c[0] == "click" for c in calls), "必须真的点一下候选")
+
+    def test_下拉没出现时返回False(self):
+        """没有建议框（话题词太冷门）→ 如实返回 False，不抛异常。"""
+        import asyncio
+
+        page, calls, cs = self._fake_page(suggest_visible=False)
+        # 关键词与候选文本设成一致，确保返回 False 的原因是"没有候选"而不是"名字不匹配"
+        self.assertFalse(asyncio.run(cs._pick_mention(page, "音乐节", timeout_ms=300)))
+        self.assertEqual(calls, [], "没有候选就不该有点击")
+
+    def test_候选不含关键词时选择器就匹配不到(self):
+        """下拉里只有「音乐现场」而要的是「音乐」→ 不点（宁可退回纯文本也别挂错）。
+
+        真机实测：查"音乐"时第一条常是「音乐现场」，盲选就把内容挂错了。
+        ★ 现在这条保证由**选择器本身**（`:text-is()` 精确匹配）承担，
+          不再是"取首条文本再判断"。
+        """
+        import asyncio
+
+        # 假 page 只在"有该文本的候选"时才算命中：这里没有「音乐」这一行
+        page, calls, cs = self._fake_page(suggest_visible=False)
+        self.assertFalse(asyncio.run(cs._pick_mention(page, "音乐", timeout_ms=300)))
+        self.assertEqual(calls, [], "没有精确匹配的候选就不该有点击")
+
+    def test_选择器指向单个候选而非整个列表(self):
+        """★ 不能选 `mention-suggest-item-container` 本身：那是整个列表容器。
+
+        真机 DOM：容器 517×300，点它的中心会点中**列表中间**那条候选 ——
+        实测把「#音乐节」点成了「#音乐节穿搭」。必须精确到候选行里的名字 span。
+        """
+        from douyin_publish_mcp import creator_steps as cs
+
+        sel = cs._mention_item_selector("音乐节")
+        self.assertIn("tag-hash-view-name", sel)
+        self.assertIn("mention-suggest-item-container", sel,
+                      "必须限定在候选列表容器内")
+
+    def test_按文本精确匹配候选而非取第一条(self):
+        """★★ 候选列表的**第一条不保证是精确匹配**。
+
+        真机实测：抖音会把**正文里已出现的实体词**也塞进候选列表
+        （正文「去年挤在人潮…」会作为候选出现，且排在真实候选之前）。
+        取 `.first` 会挂到不相干的话题上 —— 必须 `:text-is()` 精确等于话题词。
+        """
+        from douyin_publish_mcp import creator_steps as cs
+
+        sel = cs._mention_item_selector("音乐节")
+        self.assertIn(':text-is("音乐节")', sel,
+                      "必须用 :text-is() 精确匹配，不能依赖候选顺序")
+
+    def test_选择器里的引号被转义(self):
+        """话题词里带引号不能让选择器语法崩掉。"""
+        from douyin_publish_mcp import creator_steps as cs
+
+        sel = cs._mention_item_selector('说"好"')
+        self.assertIn('\\"', sel)
+        self.assertEqual(sel.count(':text-is("'), 1)
+        self.assertTrue(sel.endswith('")'))
+
+    def test_用普通click而不是native_click(self):
+        """★ 话题候选必须用普通 click：`native_click` 的第二套原生事件会多插一个话题。
+
+        真机实测：点「#音乐节」时 `native_click` 先 mouse.click 插入成功，
+        下拉随即重排，补发的原生事件按旧坐标命中了另一条候选，
+        结果正文尾部凭空多出「我的长长长假」—— 用户根本没要求这个话题。
+        """
+        import inspect
+
+        from douyin_publish_mcp import creator_steps as cs
+
+        src = inspect.getsource(cs._pick_mention)
+        self.assertIn("await item.click(", src, "必须先走普通 click")
+        first_plain = src.find("await item.click(")
+        first_native = src.find("native_click(page, item)")
+        self.assertLess(first_plain, first_native,
+                        "普通 click 必须在 native_click 之前")
+        self.assertIn("native_click", src, "点不动时仍要有 native_click 兜底")
+
+    def test_选择器用前缀匹配而非写死哈希后缀(self):
+        """class 后缀是构建产物会变（如 `-F02Ddw`/`-DwMEe8`），只能 `*=` 前缀匹配。"""
+        from douyin_publish_mcp import creator_steps as cs
+
+        self.assertEqual(cs._MENTION_SUGGEST, '[class*="mention-suggest"]')
+        for sel in (cs._MENTION_SUGGEST, cs._MENTION_LIST, cs._MENTION_NAME,
+                    cs._mention_item_selector("音乐节")):
+            # ★ 只认"构建哈希"那种后缀（如 `-F02Ddw` / `-DwMEe8`：大写开头且含数字），
+            #   不能把正常的 `-suggest` / `-item-container` 一起误伤。
+            self.assertNotRegex(sel, r"-[A-Z][A-Za-z0-9]*[0-9][A-Za-z0-9]*[\]'\"]",
+                                "不要写死哈希后缀")
+
+    def test_话题带前导井号也能归一(self):
+        """用户可能传 '#音乐节'；`#` 不能重复打。"""
+        from douyin_publish_mcp import creator_steps as cs
+        import inspect
+
+        src = inspect.getsource(cs.fill_title_and_description)
+        self.assertIn('lstrip("#")', src, "填话题前必须去掉用户自带的前导 #")
+        # 断言写入的是单个 # + 归一后的词
+        self.assertIn('" #" + keyword', src)
 
 
 if __name__ == "__main__":

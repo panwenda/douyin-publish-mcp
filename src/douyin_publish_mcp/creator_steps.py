@@ -132,13 +132,98 @@ async def _find_title_input(page, timeout_ms: int = 120000):
         await page.wait_for_timeout(400)
 
 
+#: 打进 `#` 之后抖音弹出的**话题建议框**（真机实测 2026-10-08：class 前缀
+#: `mention-suggest-`，随构建变化，故用 `*=` 前缀匹配而不是写死哈希后缀）。
+#: 真机 DOM 树：
+#:     div.mention-suggest-mount-dom             ← 下拉最外层
+#:       └ div.mention-suggest-F02Ddw
+#:           └ div.mention-suggest-item-container-*   ← 整个候选列表（517×300）
+#:               └ div.tag-dVUDkJ.tag-hash-o0tpyE     ← ★ 一行 = 一个候选
+#:                   ├ span.tag-hash-view-tag-*   ("#")
+#:                   ├ span.tag-hash-view-name-*  ("音乐节")
+#:                   └ span.tag-hash-view-count-* ("358.5亿")
+#:
+#: ★★ 两个必须绕开的坑（都是真机实测踩出来的）：
+#:  1. **别点列表容器**：`mention-suggest-item-container-*` 是整个 517×300 的列表，
+#:     点它的中心 = 点中列表**中间**那条（实测「#音乐节」被点成「#音乐节穿搭」）。
+#:  2. **别取第一条**：抖音会把**正文里已出现的实体词**也塞进候选列表
+#:     （正文「去年挤在人潮…」会作为候选出现），所以 `.first` 经常不是你要的那个。
+#:     → 用 `:text-is()` 按**文本精确等于**话题词来定位，不依赖顺序。
+_MENTION_SUGGEST = '[class*="mention-suggest"]'
+_MENTION_LIST = '[class*="mention-suggest-item-container"]'
+_MENTION_NAME = '[class*="tag-hash-view-name"]'
+
+
+def _mention_item_selector(keyword: str) -> str:
+    """候选行的精确定位器：限定在候选列表内，且**文本恰好等于**这个词。
+
+    ★ 为什么必须精确匹配文本：候选列表的**第一条不保证是精确匹配**
+      （正文里的实体词也会进列表），取 `.first` 会挂到不相干的话题上。
+    """
+    return '[class*="mention-suggest-item-container"] [class*="tag-hash-view-name"]:text-is("%s")' % (
+        str(keyword).replace('"', '\\"'),
+    )
+
+
+async def _pick_mention(page, keyword: str, timeout_ms: int = 6000) -> bool:
+    """在话题下拉里**点选**第一个候选，返回是否选中。
+
+    ★★ 这是"话题丢失"的根因所在（真机抓提交载荷证实，2026-10-08）：
+      填 ` #音乐节` 后直接按空格，`text_extra` 里的话题 `hashtag_id=0`
+      —— 抖音只当它是**普通文本**，作品页不会变成可点击的话题标签。
+      而下拉框在**按空格的那一瞬间就收起**，随后 DOM 里只剩
+      `<span data-mention="#" contenteditable="false">#音乐节</span>` 这种纯文本。
+      必须在它还开着的时候点候选（点完才拿到真 hashtag_id）。
+
+    ★ 等的是**文本恰好等于该话题词**的候选行，而不是外层容器：
+      `mention-suggest-mount-dom` 这类容器在下拉没打开时也可能存在且"可见"，
+      等它会立刻通过 → 接着取不到候选 → 误判成"没有话题可选"。
+    """
+    selector = _mention_item_selector(keyword)
+    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+    item = None
+    while True:
+        try:
+            cand = page.locator(selector).first
+            if await cand.count():
+                item = cand
+                break
+        except Exception:  # noqa: BLE001 —— 探测期间页面重渲染是常态
+            pass
+        if asyncio.get_event_loop().time() >= deadline:
+            break
+        await page.wait_for_timeout(300)
+    if item is None:
+        sys.stderr.write("[publish] 话题「%s」：建议框里没有匹配的候选\n" % keyword)
+        return False
+
+    # ★ 这里**只能**用普通 click，不能走 `native_click`：
+    #   `native_click` 会先 mouse.click 再补一整套原生事件序列，而话题候选是
+    #   纯文本 `<span>` —— 第一次点击插入话题后下拉会立即重排/收起，
+    #   补发的第二套事件按旧坐标命中了**另一个**候选，于是凭空多出
+    #   一个用户没要求的话题（实测「#音乐节」旁边冒出「我的长长长假」）。
+    #   候选行是普通 DOM，普通 click 就够；真点不动再退回 native_click。
+    try:
+        await item.click(timeout=4000)
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+    ok = await native_click(page, item)
+    if not ok:
+        sys.stderr.write("[publish] 话题「%s」：候选点不动\n" % keyword)
+    return ok
+
+
 async def fill_title_and_description(page, title: str, description: str, tags: Sequence[str]) -> None:
     """标题 + 正文 + 话题。
 
     ★ 标题输入框要等到**素材传完**才渲染（视频实测约 40 秒，大文件更久），所以等待给到 120 秒。
     ★ 视频页与图文页的 placeholder **不同**（填写/添加作品标题），故走多选择器兜底，见上。
-    ★ 正文是 contenteditable 的富文本容器，不是 textarea：先清空再逐字打，
-      话题按 " #tag + 空格" 触发下拉，最后按 Escape 收起下拉 —— 否则浮层会挡住后面的点击。
+    ★ 正文是 contenteditable 的富文本容器，不是 textarea：先清空再逐字打。
+    ★★ 话题必须**在下拉里点选**（见 `_pick_mention`）：打完 `#词` 直接按空格，
+      下拉会立刻收起、话题退化成纯文本（hashtag_id=0），发出去就没有真话题。
+      点不中也不阻断发布（宁可发出去是纯文本，也不要整条发不出去），
+      但会在 steps 里留下痕迹。
     """
     title_input = await _find_title_input(page, timeout_ms=120000)
     await title_input.fill(str(title)[:30])
@@ -150,10 +235,28 @@ async def fill_title_and_description(page, title: str, description: str, tags: S
     await page.keyboard.press("Delete")
     if description and description.strip():
         await page.keyboard.type(description.strip())
+
+    picked: List[str] = []
+    plain: List[str] = []
     for tag in tags or []:
-        await page.keyboard.type(" #" + str(tag))
-        await page.keyboard.press("Space")
+        keyword = str(tag).strip().lstrip("#")
+        if not keyword:
+            continue
+        # 每轮都从"干净的光标"开始：正文末尾可能已经有半截字符了
+        await page.keyboard.type(" #" + keyword)
+        if await _pick_mention(page, keyword):
+            picked.append(keyword)
+        else:
+            plain.append(keyword)
+            await page.keyboard.press("Space")   # 旧兜底：至少留个纯文本
+        await page.wait_for_timeout(300)
     await page.keyboard.press("Escape")
+
+    if plain:
+        sys.stderr.write(
+            "[publish] 话题没能从下拉里选中（将作为纯文本发出）：%s\n" % "、".join(plain))
+    if picked:
+        sys.stderr.write("[publish] 已选为真话题：%s\n" % "、".join(picked))
 
 
 async def set_schedule_time(page, when: str) -> None:
@@ -581,6 +684,7 @@ async def sms_input_locator(page):
 
 
 __all__ = [
+    "_pick_mention",
     "apply_collection",
     "apply_self_declaration",
     "clear_blocking_overlays",
