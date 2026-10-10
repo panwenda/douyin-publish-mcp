@@ -24,6 +24,7 @@ douyin-publish-mcp --http --port 18080 --token <secret>
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from . import __version__
@@ -52,6 +53,50 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--browser-helper", metavar="SPEC", default="", help=argparse.SUPPRESS)
     p.add_argument("--creator-helper", metavar="SPEC", default="", help=argparse.SUPPRESS)
     return p
+
+
+def _hide_console_window() -> None:
+    """把本进程**刚被分配到的**控制台窗口藏起来（仅 Windows）。
+
+    ★★ 为什么需要它（2026-10-10 用户实测反馈："为什么会拉起一个 cmd"）：
+      本项目为了保住 stdio 模式的 stdout（那是 MCP 协议通道）用 PyInstaller
+      **console 版**打包。而 console 版 bootloader 在「父进程没有控制台」时
+      会**自己 AllocConsole**（好让 `print` 有地方输出）——
+      于是客户端以 `CREATE_NO_WINDOW | DETACHED_PROCESS` 拉起它时，
+      屏幕上会**多出一个黑窗口常驻**。
+
+      对照：小红书那个是 Go 编的原生单进程，没有这一层，所以不会弹窗。
+      客户端侧无可指责 —— 它已经传了 `CREATE_NO_WINDOW`，
+      但 bootloader 分配控制台是**它自己的行为**，父进程说了不算。
+
+    ★ 为什么不干脆用 `--noconsole` 打包：那会把 `sys.stdout` 置成 **None**，
+      **直接废掉 stdio 模式** —— 而 stdout 就是 MCP 协议通道（规范要求 UTF-8
+      的 JSON-RPC 走它）。服务模式（`--http`）不需要可见控制台，
+      所以保留 console 子系统、运行时把窗口藏掉，两边都不牺牲。
+
+    ★ 逃生舱：`DOUYIN_KEEP_CONSOLE=1` 时不藏（手动双击调试、
+      或排查"启动即退出"这类问题时要看 `print` 输出）。
+
+    ★ 藏窗口失败**不影响服务**（多一个窗口而已），所以整段吞异常。
+    """
+    if not sys.platform.startswith("win"):
+        return
+
+    keep = (os.environ.get("DOUYIN_KEEP_CONSOLE") or "").strip().lower()
+    if keep not in ("", "0", "false", "no", "off"):
+        return
+
+    try:
+        import ctypes
+
+        # GetConsoleWindow 返回**本进程关联的**那个控制台窗口；
+        # 没有控制台（例如宿主已经给了管道）时返回 0，此时什么都不用做。
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            SW_HIDE = 0
+            ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+    except Exception:
+        pass
 
 
 def _force_utf8_stdio() -> None:
@@ -91,6 +136,9 @@ def _force_utf8_stdio() -> None:
 def main(argv=None) -> int:
     # ★ 必须最早执行：下面任何一句都可能往 stdout/stderr 写中文。
     _force_utf8_stdio()
+    # ★ 紧随其后：把 console 版 bootloader 自己分配的那个黑窗口藏掉
+    #   （见 _hide_console_window 的说明；对 --http / stdio / 两个 helper 一并生效）
+    _hide_console_window()
     args = build_parser().parse_args(argv)
     if args.browser_helper:
         from .browser_helper import main as helper_main

@@ -172,3 +172,22 @@ Write-Host "商店配置（streamable_http）里 command 就填这个绝对路�
 Write-Host "  command = $exePath"
 Write-Host "  args    = --http --port 18080"
 Write-Host "  url     = http://127.0.0.1:18080/mcp"
+
+# ── 关于控制台窗口：为什么不加 --noconsole（2026-10-10）──────────────
+# 用户实测反馈：客户端拉起本服务时会**多出一个黑窗口**（小红书那个 Go 编的不会）。
+#
+# 根因：console 版 bootloader 在「父进程没有控制台」时会**自己 AllocConsole**
+#   （好让 print 有输出）—— 客户端虽然传了 CREATE_NO_WINDOW，但那是 bootloader
+#   自己的行为，父进程管不了。实测：以相同标志手动拉起，进程树会多一层
+#   bootloader → 子进程。
+#
+# ★ 为什么不用 --noconsole 根治：它会把 sys.stdout 置成 **None**，
+#   而 **stdio 模式下 stdout 就是 MCP 协议通道**（规范要求 UTF-8 的 JSON-RPC
+#   走它）—— 加了就等于废掉 stdio 形态，那一批已发布的 stdio 商店配置会静默起不来。
+#
+# ⇒ 改为**运行期隐藏窗口**：src/douyin_publish_mcp/__main__.py 的
+#   `_hide_console_window()`（在 main 最早期调用，对所有入口生效）。
+#   保留 console 子系统（stdio 可用），只在运行时把窗口藏掉。
+#   要看输出时设 DOUYIN_KEEP_CONSOLE=1。
+#
+# ⛔ 别"优化"成 --noconsole —— 那会静默破坏 stdio 模式（已实测确认）。
