@@ -133,6 +133,17 @@ foreach ($name in $excludeNames) { $exclude += @("--exclude-module", $name) }
 
 $pkArgs = @(
   "-m", "PyInstaller", "--noconfirm", "--clean", $mode,
+  # ★★ --noconsole 是**弹窗修复的根治手段**（2026-10-10 二次定位后才确定）：
+  #   console 版 bootloader 在「父进程没有控制台」时会**自己 AllocConsole**，
+  #   而现代 Windows 默认终端是 **Windows Terminal** → 分配控制台会**弹出 WT 窗口**。
+  #   此时 GetConsoleWindow() 只拿到 PseudoConsoleWindow（中间层），
+  #   **ShowWindow 藏它关不掉 WT 的窗口** —— 所以"运行期隐藏"治不了，必须不分配控制台。
+  #   ★ 代价与对策：--noconsole 会把 sys.stdin/stdout/stderr 置成 None，
+  #     而 stdio 模式下 stdout 就是 MCP 协议通道 → 由
+  #     `__main__._restore_std_streams_if_needed()` 从 fd 0/1/2 手动接回来
+  #     （宿主用管道连接时 fd 本身有效）。两者必须**成对**存在：
+  #     只加 --noconsole 不恢复标准流 = stdio 模式静默失效。
+  "--noconsole",
   "--name", "douyin-publish-mcp",
   "--paths", (Join-Path $root "src"),
   "--workpath", $work, "--specpath", $work, "--distpath", $dist,
@@ -173,21 +184,28 @@ Write-Host "  command = $exePath"
 Write-Host "  args    = --http --port 18080"
 Write-Host "  url     = http://127.0.0.1:18080/mcp"
 
-# ── 关于控制台窗口：为什么不加 --noconsole（2026-10-10）──────────────
+# ── 关于控制台窗口：为什么**必须**加 --noconsole（2026-10-10，两轮才定位准）──
 # 用户实测反馈：客户端拉起本服务时会**多出一个黑窗口**（小红书那个 Go 编的不会）。
 #
 # 根因：console 版 bootloader 在「父进程没有控制台」时会**自己 AllocConsole**
 #   （好让 print 有输出）—— 客户端虽然传了 CREATE_NO_WINDOW，但那是 bootloader
-#   自己的行为，父进程管不了。实测：以相同标志手动拉起，进程树会多一层
-#   bootloader → 子进程。
+#   自己的行为，父进程管不了。
 #
-# ★ 为什么不用 --noconsole 根治：它会把 sys.stdout 置成 **None**，
-#   而 **stdio 模式下 stdout 就是 MCP 协议通道**（规范要求 UTF-8 的 JSON-RPC
-#   走它）—— 加了就等于废掉 stdio 形态，那一批已发布的 stdio 商店配置会静默起不来。
+# ★★ 第一版修法（**错**）：保留 console + 运行时 `_hide_console_window()`。
+#   实测无效 —— 因为**现代 Windows 默认终端是 Windows Terminal**：分配控制台会
+#   弹出 WT 窗口（`CASCADIA_HOSTING_WINDOW_CLASS`，标题就是本 exe 路径），
+#   而 `GetConsoleWindow()` 拿到的是 `PseudoConsoleWindow`（中间层），
+#   **ShowWindow 藏它关不掉 WT 的窗口**。
+#   （第一版"验证通过"是**漏检**：只枚举了 exe 自己的窗口，
+#    没枚举 WindowsTerminal.exe 的；且当时 PseudoConsoleWindow 恰好是 False。）
 #
-# ⇒ 改为**运行期隐藏窗口**：src/douyin_publish_mcp/__main__.py 的
-#   `_hide_console_window()`（在 main 最早期调用，对所有入口生效）。
-#   保留 console 子系统（stdio 可用），只在运行时把窗口藏掉。
-#   要看输出时设 DOUYIN_KEEP_CONSOLE=1。
+# ⇒ 只有 `--noconsole` 能从根上"不分配控制台"。
+#   ★ 代价与对策（**必须成对存在，缺一即坏**）：
+#     --noconsole 会把 sys.stdin/stdout/stderr 置成 None，
+#     而 **stdio 模式下 stdout 就是 MCP 协议通道**。
+#     → 由 `src/douyin_publish_mcp/__main__.py` 的
+#       `_restore_std_streams_if_needed()` 从 fd 0/1/2 手动接回来
+#       （宿主用管道连接时 fd 本身仍然有效）。
 #
-# ⛔ 别"优化"成 --noconsole —— 那会静默破坏 stdio 模式（已实测确认）。
+# ⛔ 别把 --noconsole 去掉 —— 去掉就回到"弹 Windows Terminal 窗口"。
+# ⛔ 也别把 `_restore_std_streams_if_needed()` 删掉 —— 删了 stdio 形态静默失效。

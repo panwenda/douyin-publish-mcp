@@ -24,6 +24,7 @@ douyin-publish-mcp --http --port 18080 --token <secret>
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 
@@ -55,29 +56,55 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _restore_std_streams_if_needed() -> None:
+    """把 PyInstaller `--noconsole` 置成 None 的标准流从 fd 接回来。
+
+    ★★ 为什么必须做（2026-10-10 实测定位，第一版修法是错的）：
+      本项目用 `--noconsole` 打包 —— 因为 console 版 bootloader 在「父进程没有
+      控制台」时会**自己 AllocConsole**。而**现代 Windows 默认终端是
+      Windows Terminal**：分配控制台会**弹出 Windows Terminal 窗口**
+      （实测拿到 `CASCADIA_HOSTING_WINDOW_CLASS`，标题就是本 exe 的路径）。
+      此时 `GetConsoleWindow()` 返回的是 `PseudoConsoleWindow`（中间层），
+      **`ShowWindow` 藏它根本关不掉 Windows Terminal 的窗口** ——
+      所以「运行期隐藏窗口」这条路走不通，只能不分配控制台。
+
+    ★ 但 `--noconsole` 的代价是 PyInstaller 把 `sys.stdin/stdout/stderr` 置成 `None`，
+      而 **stdio 模式下 stdout 就是 MCP 协议通道**（规范要求 UTF-8 的 JSON-RPC 走它）——
+      宿主是用**管道**接子进程的 fd 0/1/2 的，**文件描述符本身仍然有效**，
+      只是没挂 Python 包装对象。这里手动 `io.open(fd)` 接回来即可。
+
+    ★ 宿主没给管道时（手动双击、直接跑 exe）`io.open` 会失败 → 挂黑洞，
+      这样 `print` 不会因 `sys.stdout is None` 而崩。
+    """
+    if os.name != "nt":
+        return
+    for name, fd, mode in (("stdin", 0, "rb"), ("stdout", 1, "wb"), ("stderr", 2, "wb")):
+        if getattr(sys, name, None) is not None:
+            continue
+        try:
+            raw = open(fd, mode, buffering=0, closefd=False)
+            setattr(sys, name, io.TextIOWrapper(
+                raw, encoding="utf-8", errors="replace", write_through=True))
+        except OSError:
+            try:
+                setattr(sys, name, open(os.devnull, mode))
+            except OSError:
+                pass
+
+
 def _hide_console_window() -> None:
     """把本进程**刚被分配到的**控制台窗口藏起来（仅 Windows）。
 
-    ★★ 为什么需要它（2026-10-10 用户实测反馈："为什么会拉起一个 cmd"）：
-      本项目为了保住 stdio 模式的 stdout（那是 MCP 协议通道）用 PyInstaller
-      **console 版**打包。而 console 版 bootloader 在「父进程没有控制台」时
-      会**自己 AllocConsole**（好让 `print` 有地方输出）——
-      于是客户端以 `CREATE_NO_WINDOW | DETACHED_PROCESS` 拉起它时，
-      屏幕上会**多出一个黑窗口常驻**。
+    ⚠️ **这一段治不了 Windows Terminal** —— 现在的根治手段是打包时用
+    `--noconsole`（见 [`_restore_std_streams_if_needed`] 的说明：console 版
+    bootloader 会自己 AllocConsole，而默认终端是 Windows Terminal 时
+    会弹出 WT 窗口，`GetConsoleWindow()` 只拿到 `PseudoConsoleWindow` 中间层，
+    藏它关不掉 WT 的窗口）。
 
-      对照：小红书那个是 Go 编的原生单进程，没有这一层，所以不会弹窗。
-      客户端侧无可指责 —— 它已经传了 `CREATE_NO_WINDOW`，
-      但 bootloader 分配控制台是**它自己的行为**，父进程说了不算。
+    保留它是当**兜底**：万一将来在非 WT 终端（传统 conhost）下又出现控制台，
+    这里至少能把窗口藏掉。失败不影响服务（整段吞异常）。
 
-    ★ 为什么不干脆用 `--noconsole` 打包：那会把 `sys.stdout` 置成 **None**，
-      **直接废掉 stdio 模式** —— 而 stdout 就是 MCP 协议通道（规范要求 UTF-8
-      的 JSON-RPC 走它）。服务模式（`--http`）不需要可见控制台，
-      所以保留 console 子系统、运行时把窗口藏掉，两边都不牺牲。
-
-    ★ 逃生舱：`DOUYIN_KEEP_CONSOLE=1` 时不藏（手动双击调试、
-      或排查"启动即退出"这类问题时要看 `print` 输出）。
-
-    ★ 藏窗口失败**不影响服务**（多一个窗口而已），所以整段吞异常。
+    ★ 逃生舱：`DOUYIN_KEEP_CONSOLE=1` 时不藏（手动双击调试时看输出用）。
     """
     if not sys.platform.startswith("win"):
         return
@@ -89,7 +116,7 @@ def _hide_console_window() -> None:
     try:
         import ctypes
 
-        # GetConsoleWindow 返回**本进程关联的**那个控制台窗口；
+        # GetConsoleWindow 返回**本进程关联的**控制台窗口；
         # 没有控制台（例如宿主已经给了管道）时返回 0，此时什么都不用做。
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
         if hwnd:
@@ -134,10 +161,13 @@ def _force_utf8_stdio() -> None:
 
 
 def main(argv=None) -> int:
-    # ★ 必须最早执行：下面任何一句都可能往 stdout/stderr 写中文。
+    # ★ 必须**第一句**：--noconsole 打包时标准流是 None，
+    #   而下面任何一句都可能往 stdout/stderr 写（且 stdio 模式下 stdout 就是协议通道）。
+    _restore_std_streams_if_needed()
+    # ★ 紧随其后：把编码钉成 UTF-8（理由见 _force_utf8_stdio 的说明）
     _force_utf8_stdio()
-    # ★ 紧随其后：把 console 版 bootloader 自己分配的那个黑窗口藏掉
-    #   （见 _hide_console_window 的说明；对 --http / stdio / 两个 helper 一并生效）
+    # ★ 兜底：万一将来又出现"有控制台"的场景（非 WT 终端），把窗口藏掉。
+    #   注意它**治不了** Windows Terminal —— 那种情况必须靠 --noconsole（见上）。
     _hide_console_window()
     args = build_parser().parse_args(argv)
     if args.browser_helper:
