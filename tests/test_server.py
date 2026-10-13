@@ -4,6 +4,7 @@
   它一旦回退，模型一次误判就直接落到用户账号上，而发布是不可撤销的。
 """
 
+import builtins
 import json
 import re
 import subprocess
@@ -755,6 +756,82 @@ class TestStdioEncoding(unittest.TestCase):
                       "stdout 没被钉成 UTF-8：中文仍按 GBK 写出去了")
         self.assertNotIn(b"\xb2\xe9\xd1\xaf", raw, "仍有 GBK 字节残留")
         self.assertIn("查询某个抖音账号的登录态", raw.decode("utf-8"))
+
+
+class TestStdStreamRestore(unittest.TestCase):
+    """`--noconsole` 打包后从 fd 接回标准流 —— 接回来的**必须一直是文本流**。
+
+    ★ v0.3.5 发出后真机踩到（用户报"抖音 MCP 服务拉不起来"）：
+      宿主传下来的 std 句柄**无效**时，`open(fd, "wb")` 抛
+      `OSError: [WinError 6] 句柄无效`；原实现的兜底是
+      `setattr(sys, name, open(os.devnull, "wb"))` —— 挂上去的是 **`BufferedWriter`**，
+      于是之后 `sys.stderr.write("…")` 抛
+      `TypeError: a bytes-like object is required, not 'str'`。
+
+      症状极具误导性：**服务起不来**，而 traceback 指向
+      `http_server.serve_http` 里那句"HTTP 服务已启动"的日志行（526 行）——
+      看着像日志写错了，实际是标准流类型错了。
+
+    ★ 为什么客户端那条路径碰不到：客户端 `local_service` 用 `Stdio::null()`，
+      给的是**有效**句柄 → 走 `open(fd)` 成功分支。所以只在"换个方式拉起"时才炸。
+    """
+
+    def _restore_with_fake_open(self, fake_open):
+        """在「sys 的三个流都是 None」的前提下跑恢复逻辑，返回那个假 sys。"""
+        import types
+
+        from douyin_publish_mcp import __main__ as entry
+
+        fake_sys = types.SimpleNamespace(stdin=None, stdout=None, stderr=None)
+        with mock.patch.object(entry, "sys", fake_sys), \
+             mock.patch.object(builtins, "open", fake_open):
+            entry._restore_std_streams_if_needed()
+        return fake_sys
+
+    def test_句柄无效时兜底流也必须能写字符串(self):
+        """★ 核心回归：兜底挂黑洞时，`write(str)` 不能炸。
+
+        ⚠️ 只断言"流不是 None"是**抓不住**这个 bug 的 —— 二进制流也不是 None。
+           必须真的往里写一个字符串（就像 `serve_http` 那句启动日志一样）。
+        """
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(file, mode="r", *a, **kw):
+            if isinstance(file, int):                    # 模拟"宿主没给有效句柄"
+                raise OSError(6, "句柄无效")
+            return real_open(file, mode, *a, **kw)
+
+        fake_sys = self._restore_with_fake_open(fake_open)
+
+        for name in ("stdout", "stderr"):
+            stream = getattr(fake_sys, name)
+            self.assertIsNotNone(stream, "%s 没被接回来" % name)
+            try:
+                stream.write("[douyin-publish-mcp] HTTP 服务已启动：http://127.0.0.1:18080/mcp\n")
+                stream.flush()
+            except TypeError as e:  # ← 修复前这里就是 "a bytes-like object is required, not 'str'"
+                self.fail("%s 接回来的是二进制流，write(str) 抛了：%s（类型 %s）"
+                          % (name, e, type(stream).__name__))
+
+    def test_恢复后是文本流而非裸二进制(self):
+        """兜底流得是 TextIOWrapper —— 光"能写"还不够，编码行为也要一致。"""
+        import builtins
+        import io
+
+        real_open = builtins.open
+
+        def fake_open(file, mode="r", *a, **kw):
+            if isinstance(file, int):
+                raise OSError(6, "句柄无效")
+            return real_open(file, mode, *a, **kw)
+
+        fake_sys = self._restore_with_fake_open(fake_open)
+        for name in ("stdout", "stderr"):
+            self.assertIsInstance(getattr(fake_sys, name), io.TextIOWrapper,
+                                  "%s 必须是 TextIOWrapper（否则编码/换行行为都不一样）" % name)
+            self.assertEqual(getattr(fake_sys, name).encoding, "utf-8")
 
 
 class FakeWeb:

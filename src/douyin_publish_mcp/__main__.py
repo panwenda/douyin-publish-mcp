@@ -75,6 +75,18 @@ def _restore_std_streams_if_needed() -> None:
 
     ★ 宿主没给管道时（手动双击、直接跑 exe）`io.open` 会失败 → 挂黑洞，
       这样 `print` 不会因 `sys.stdout is None` 而崩。
+
+    🚨🚨 实测踩到的坑（v0.3.5 发布后才暴露）：黑洞**也必须包一层 TextIOWrapper**。
+      原实现是 `setattr(sys, name, open(os.devnull, mode))` —— 二元模式的 `open`
+      返回的是 **`BufferedWriter`（二进制流）**，于是之后任何
+      `sys.stderr.write("中文…")` 都抛
+      `TypeError: a bytes-like object is required, not 'str'`。
+      症状极具误导性：**服务"拉不起来"**，而 traceback 指向的是
+      `http_server.serve_http` 里那句"HTTP 服务已启动"的日志行（526 行），
+      看着像日志写错了，实际是标准流类型错了。
+      触发条件：宿主传下来的 std 句柄无效（`open(fd)` 抛 `OSError: [WinError 6] 句柄无效`）。
+      客户端 `local_service` 用的是 `Stdio::null()`（给的是有效句柄），所以那条路径**碰不到** ——
+      这也解释了为什么"平时好好的、换个方式拉起就崩"。
     """
     if os.name != "nt":
         return
@@ -83,13 +95,14 @@ def _restore_std_streams_if_needed() -> None:
             continue
         try:
             raw = open(fd, mode, buffering=0, closefd=False)
-            setattr(sys, name, io.TextIOWrapper(
-                raw, encoding="utf-8", errors="replace", write_through=True))
         except OSError:
+            # 句柄无效 → 挂黑洞。★ 注意这里**不能直接 setattr**，要走下面统一的包装。
             try:
-                setattr(sys, name, open(os.devnull, mode))
+                raw = open(os.devnull, mode)
             except OSError:
-                pass
+                continue
+        setattr(sys, name, io.TextIOWrapper(
+            raw, encoding="utf-8", errors="replace", write_through=True))
 
 
 def _hide_console_window() -> None:
