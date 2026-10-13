@@ -114,12 +114,16 @@ class App:
             self.set_notice("账号名只能是字母、数字、下划线、连字符（1~64 位）。")
             return
         try:
-            snap = self.sessions.start_login(account, headed=headed)
+            # ★ 与工具调用共用同一把账号锁（页面和工具是同一个 Server 实例）：
+            #   否则"页面上点登录"能和"工具在发布"撞成两个浏览器操作同一个号。
+            with self.mcp.locks.hold(account):
+                snap = self.sessions.start_login(account, headed=headed)
         except ConfigError as e:
             self.set_notice(str(e))
             return
         self.set_notice(
-            f"已发起账号「{account}」的登录。二维码在页面上，请直接扫（不弹浏览器窗口）。"
+            f"已发起账号「{account}」的登录。**会弹出一个浏览器窗口**（登录必须用真窗口），"
+            f"二维码在窗口里、也贴在本页下面，两种扫法都行；扫完窗口自动关闭。"
             f"（当前状态：{'等待扫码' if snap.get('running') else '已结束'}）",
             is_error=False,
         )
@@ -135,6 +139,8 @@ class App:
         self.set_notice("正在检查登录态…", is_error=False)
 
         def worker() -> None:
+            # ★ 这里**不拿账号锁**：`check` 只打一次直连探针（不开浏览器），
+            #   与工具侧的 `douyin_account_status` 同一个口径 —— 见 server._LOCK_FREE_TOOLS。
             try:
                 rec = self.sessions.check(account)
                 self.set_notice(
@@ -153,7 +159,9 @@ class App:
             self.set_notice("账号名只能是字母、数字、下划线、连字符（1~64 位）。")
             return
         try:
-            plan = account_mod.logout(self.cfg, account, confirm=confirm)
+            # ★ 删凭据要拿账号锁：正跑着发布时把登录态删掉，发布那边收尾还会把文件写回来。
+            with self.mcp.locks.hold(account):
+                plan = account_mod.logout(self.cfg, account, confirm=confirm)
         except ConfigError as e:
             self.set_notice(str(e))
             return

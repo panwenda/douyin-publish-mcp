@@ -103,20 +103,6 @@ class SessionCase(unittest.TestCase):
 
 
 class TestSingleSession(SessionCase):
-    def test_开新会话会关掉旧的(self):
-        first, second = FakeProc(exit_after=None), FakeProc(exit_after=None)
-        with mock.patch.object(
-            browser, "spawn_helper",
-            side_effect=[helper_run(first, self.root), helper_run(second, self.root)],
-        ):
-            self.mgr.start_login("main")
-            self.assertTrue(self.mgr.snapshot()["running"])
-            self.mgr.start_login("main2")
-        self.assertTrue(first.terminated, "旧的待扫码会话必须被关掉")
-        snap = self.mgr.snapshot()
-        self.assertEqual(snap["account"], "main2")
-        self.assertTrue(snap["running"])
-
     def test_取消会话(self):
         proc = FakeProc(exit_after=None)
         with self._spawn(proc):
@@ -165,6 +151,97 @@ class TestSingleSession(SessionCase):
         self.assertEqual("timeout", self.mgr.snapshot()["state"])
 
 
+class TestMultiAccountSessions(SessionCase):
+    """★ 会话**按账号分开** + 「已经在等就复用」（2026-10-13 修的两个 bug）。
+
+    两条都是用户的真实困惑：
+      · 照提示"扫完再调一次确认结果"，结果把手里那张二维码弄失效了；
+      · 登录 B 号时，A 号还在等的二维码被顶掉了。
+    """
+
+    def test_重复发起复用同一个会话(self):
+        proc = FakeProc(exit_after=None)
+        with self._spawn(proc) as spawn:
+            self.mgr.start_login("main")
+            self.mgr.start_login("main")
+        self.assertEqual(1, spawn.call_count, "同一个号不该另起一个登录进程")
+        self.assertFalse(proc.terminated, "复用会话时不能把它关掉")
+        self.assertTrue(self.mgr.snapshot("main")["running"])
+
+    def test_force才重开会话(self):
+        first, second = FakeProc(exit_after=None), FakeProc(exit_after=None)
+        with mock.patch.object(
+            browser, "spawn_helper",
+            side_effect=[helper_run(first, self.root), helper_run(second, self.root)],
+        ) as spawn:
+            self.mgr.start_login("main")
+            self.mgr.start_login("main", force=True)
+        self.assertEqual(2, spawn.call_count, "force=true 才该另起一个")
+        self.assertTrue(first.terminated, "force=true 要关掉还在等的旧会话")
+        self.assertTrue(self.mgr.snapshot("main")["running"])
+
+    def test_不同账号各自保留会话(self):
+        work, personal = FakeProc(exit_after=None), FakeProc(exit_after=None)
+        with mock.patch.object(
+            browser, "spawn_helper",
+            side_effect=[helper_run(work, self.root), helper_run(personal, self.root)],
+        ):
+            self.mgr.start_login("work")
+            self.mgr.start_login("personal")
+        self.assertFalse(work.terminated, "登录另一个号不该关掉这个号的会话")
+        self.assertEqual(["personal", "work"], self.mgr.running_accounts())
+        self.assertTrue(self.mgr.snapshot("work")["running"])
+        self.assertTrue(self.mgr.snapshot("personal")["running"])
+
+    def test_会话结束后再发起会重开(self):
+        """等超时/扫完之后再调，该给的是一张**新**码，不是永远复用那个死掉的。"""
+        first = FakeProc(exit_after=0, stdout=[payload_fail("timeout", "等待扫码登录超时")])
+        second = FakeProc(exit_after=None)
+        with mock.patch.object(
+            browser, "spawn_helper",
+            side_effect=[helper_run(first, self.root), helper_run(second, self.root)],
+        ) as spawn:
+            self.mgr.start_login("main")
+            deadline = time.time() + 3
+            while time.time() < deadline and self.mgr.snapshot("main")["running"]:
+                time.sleep(0.05)
+            self.mgr.start_login("main")
+        self.assertEqual(2, spawn.call_count, "旧会话已结束，应重新发起")
+        self.assertTrue(self.mgr.snapshot("main")["running"])
+
+    def test_取消只影响那个账号(self):
+        work, personal = FakeProc(exit_after=None), FakeProc(exit_after=None)
+        with mock.patch.object(
+            browser, "spawn_helper",
+            side_effect=[helper_run(work, self.root), helper_run(personal, self.root)],
+        ):
+            self.mgr.start_login("work")
+            self.mgr.start_login("personal")
+            self.mgr.cancel_login("work")
+        self.assertTrue(work.terminated)
+        self.assertFalse(personal.terminated, "取消 work 不该动 personal")
+        self.assertTrue(self.mgr.snapshot("personal")["running"])
+
+    def test_检查只看那个账号的会话(self):
+        """work 在等扫码，不该把 personal 的检查也跳过。"""
+        proc = FakeProc(exit_after=None)
+        with self._spawn(proc), self._check() as check:
+            self.mgr.start_login("work")
+            skipped = self.mgr.check("work")
+            fresh = self.mgr.check("personal")
+        self.assertTrue(skipped.skipped, "正在等扫码的号要跳过检查")
+        self.assertFalse(getattr(fresh, "skipped", False))
+        self.assertEqual(1, check.call_count, "personal 那次应该真去查")
+
+    def test_检查结论按账号各存一份(self):
+        with self._check(logged_in=True, output="work 已登录"):
+            self.mgr.check("work")
+        with self._check(logged_in=False, output="personal 未登录"):
+            self.mgr.check("personal")
+        self.assertIs(True, self.mgr.snapshot("work")["loggedIn"])
+        self.assertIs(False, self.mgr.snapshot("personal")["loggedIn"])
+
+
 class TestCheck(SessionCase):
     def test_check_记录最近一次结论(self):
         with self._check() as check:
@@ -179,6 +256,27 @@ class TestCheck(SessionCase):
         with self._check(logged_in=False, output="未登录"):
             rec = run_check(self.cfg, "main")
         self.assertIs(False, rec.logged_in)
+
+    def test_最近结论传空要能算账不会自锁(self):
+        """★ `last_check()` 传空 = "显示的那个账号"，算键要拿同一把锁。
+
+        实现里若在**持锁状态**再去算键，非重入锁会让调用方永久挂住 ——
+        表现成"工具没反应"而不是报错，最难查。这里用独立线程 + 超时把它钉住。
+        """
+        done = threading.Event()
+        box: dict = {}
+
+        def call_it() -> None:
+            box["rec"] = self.mgr.last_check()
+            done.set()
+
+        threading.Thread(target=call_it, daemon=True).start()
+        self.assertTrue(done.wait(2), "last_check() 传空不该自锁")
+        self.assertIsNone(box["rec"], "还没查过时是 None")
+
+        with self._check(logged_in=True, output="刚查过"):
+            self.mgr.check("main")
+        self.assertEqual("main", self.mgr.last_check().account)
 
     def test_检查不开浏览器(self):
         """★ 检查是直连探针：不该起进程、也不该碰驱动（v0.2 那版要开一个浏览器）。"""
@@ -202,7 +300,9 @@ class TestSnapshotShape(SessionCase):
         snap = self.mgr.snapshot()
         self.assertFalse(snap["running"])
         self.assertIsNone(snap["loggedIn"])
-        self.assertEqual(snap["account"], "")
+        # ★ 2026-10-13：快照带上"显示的那个账号"（没有会话时=默认账号），
+        #   状态页的表单直接读它 —— 原来是空串，页面得自己再兜一次默认值。
+        self.assertEqual("main", snap["account"])
         self.assertFalse(snap["qrAvailable"])
 
     def test_二维码出现后可取(self):

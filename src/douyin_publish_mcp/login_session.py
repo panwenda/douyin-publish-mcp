@@ -1,13 +1,21 @@
-"""登录会话：一个「等扫码」的自动化进程 + 串行化的一次性检查。
+"""登录会话：一个「等扫码」的自动化进程 + 串行化的一次性检查（**按账号分开**）。
 
 ## 为什么要有它（约束照小红书 MCP 的 login_session.go 抄）
 
 扫码登录要等用户拿手机扫（几十秒到几分钟）。三个后果：
 
 1. 当成同步调用会**卡住客户端**（stdio 下连"还在等"都没法回报）；
-2. 每点一次就多一个浏览器活到超时为止 —— 所以必须有「同一时刻只保留一个待扫码会话」
-   的约束，开新的就把旧的关掉；
+2. 同一个账号**同一时刻只保留一个待扫码会话**（已经在等就复用，见下面"两条铁律"）；
 3. 「现在到哪一步了」得有地方回答：会话状态、二维码、扫码到底成没成。
+
+## 两条铁律（2026-10-13 修，都是踩出来的）
+
+1. **按账号分开**：`LoginSessionManager` 的会话与检查结论都是 `账号 → ...` 字典。
+   多账号下"登录 work 会不会顶掉 personal 的待扫码会话"的答案是**不会**。
+   （原来只有一个 `_session`，登录 B 会把 A 的二维码顶掉。）
+2. **已经在等扫码就复用，不重开**：重复调 `douyin_account_login` 只是**继续查**
+   那一个会话 —— 工具提示里写着"扫完再调一次确认结果"，若照做却把用户手里的
+   二维码弄失效，就是最典型的自相矛盾。要一张新码走 `force=True`。
 
 ## 与 v0.2 的差别
 
@@ -32,7 +40,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from . import douyin_browser as browser
 from .account import AccountCheck, check_account
-from .config import RuntimeConfig, credential_path, data_dir
+from .config import RuntimeConfig, account_key, credential_path, data_dir
 
 _OUTPUT_LIMIT = 8000      # 快照里保留的输出长度（够看结论即可）
 _DEFAULT_MAX_WAIT = 240   # 等扫码的上限：再久用户基本已经走开了
@@ -228,78 +236,137 @@ class LoginSession:
 
 
 class LoginSessionManager:
-    """进程内共享的登录会话 + 最近一次检查结论。
+    """进程内共享的登录会话 + 最近一次检查结论（**都按账号分开**）。
 
     一个进程一个实例：stdio 的 MCP 服务与 HTTP 状态页用的是**同一份状态**，
     所以从页面扫码、从工具查询看到的是同一件事。
+
+    ## 两条铁律（都是踩出来的，别改回去）
+
+    1. **按账号分开**：`_sessions` / `_checks` 都是 `账号 → ...` 的字典。
+       多账号下"登录 work 会不会顶掉 personal 的待扫码会话"的答案是**不会** ——
+       每个号各扫各的。
+    2. **已经在等扫码就复用，不重开**：重复调 `douyin_account_login` 只是**继续查**
+       那一个会话。重开会让用户手里那张二维码当场作废（提示里写着"扫完再调一次
+       确认结果"，照做却把码弄失效，是最容易踩的自相矛盾）。
+       确实想要一张新码时走 `force=True`（或先在状态页点"取消等待扫码"）。
     """
 
     def __init__(self, cfg: RuntimeConfig):
         self.cfg = cfg
         self._lock = threading.Lock()
-        self._session: Optional[LoginSession] = None
-        self._check: Optional[CheckRecord] = None
+        self._sessions: Dict[str, LoginSession] = {}
+        self._checks: Dict[str, CheckRecord] = {}
+        #: 状态页按"单会话"渲染，所以得记住显示哪个号（最近动过的那个）
+        self._last_account = ""
+
+    # ── 内部 ────────────────────────────────────────────────
+    def _session(self, key: str) -> Optional[LoginSession]:
+        with self._lock:
+            return self._sessions.get(key)
+
+    def _resolve_key(self, account: str) -> str:
+        """把入参算成账号键；传空表示"显示的那一个"。"""
+        if (account or "").strip():
+            return account_key(account)
+        return self._display_key()
+
+    def _display_key(self) -> str:
+        """状态页显示哪个账号：优先"正在等扫码"的，否则最近动过的，再否则默认账号。"""
+        with self._lock:
+            for key, sess in self._sessions.items():
+                if sess.running:
+                    return key
+            return self._last_account or account_key("")
 
     # ── check ───────────────────────────────────────────────
     def check(self, account: str) -> CheckRecord:
-        """跑一次登录态检查。
+        """跑一次登录态检查（**只查这个号**）。
 
         ★ 正在等扫码时不查：此刻用户该做的事是去扫码，不是读一份"上次的结论"。
           直接回一条 `skipped` 记录，由调用方换成"等扫码结束再查"的说法。
         """
-        session = self.session()
+        key = account_key(account)
+        session = self._session(key)
         if session is not None and session.running:
             return CheckRecord(
-                account=account,
+                account=key,
                 logged_in=None,
                 ok=False,
                 output=(
                     "账号「%s」的登录会话正在等扫码 —— 此刻不做登录态检查"
-                    "（扫码完成后会自动检查一次）。" % session.account
+                    "（扫码完成后会自动检查一次）。" % key
                 ),
                 skipped=True,
             )
-        rec = run_check(self.cfg, account)
+        rec = run_check(self.cfg, key)
         with self._lock:
-            self._check = rec
+            self._checks[key] = rec
+            self._last_account = key      # 状态页跟着"最近查的那个号"走
         return rec
 
-    def last_check(self) -> Optional[CheckRecord]:
+    def last_check(self, account: str = "") -> Optional[CheckRecord]:
+        # ★ 先把键算出来再上锁：`_resolve_key("")` 会走 `_display_key()`，
+        #   那里面也要拿这把锁 —— 在锁里调它就是自己等自己（非重入锁，直接死锁）。
+        key = self._resolve_key(account)
         with self._lock:
-            return self._check
+            return self._checks.get(key)
 
     # ── login ───────────────────────────────────────────────
     def start_login(self, account: str, headed: bool = True,
-                    max_wait_sec: float = _DEFAULT_MAX_WAIT) -> Dict[str, Any]:
-        account = (account or "").strip()
-        # ★ 同一时刻只保留一个待扫码会话：开新的先把旧的关掉
-        #   （否则每调一次就多一个浏览器，活到各自超时为止）
-        self.cancel_login(quiet=True)
-        session = LoginSession(self.cfg, account, headed=headed, on_finish=self._after_login,
-                              max_wait_sec=max_wait_sec)
+                    max_wait_sec: float = _DEFAULT_MAX_WAIT,
+                    force: bool = False) -> Dict[str, Any]:
+        """发起（或**复用**）该账号的待扫码会话。
+
+        `force=True` 才重开：先把同账号那个还在等的会话关掉，再起一个新的。
+        """
+        key = account_key(account)
+
         with self._lock:
-            self._session = session
+            current = self._sessions.get(key)
+            reusable = current is not None and current.running and not force
+            if not reusable:
+                self._sessions.pop(key, None)
+            self._last_account = key
+
+        if reusable:
+            return self.snapshot(key)
+
+        if current is not None:
+            # ★ 放到锁外：取消要等子进程退出，握着锁会把别的账号也堵住。
+            #   已结束的会话 cancel() 是空操作，这里不必先判断。
+            current.cancel()
+
+        session = LoginSession(self.cfg, key, headed=headed, on_finish=self._after_login,
+                               max_wait_sec=max_wait_sec)
+        with self._lock:
+            self._sessions[key] = session
         # ★ 返回**合并后的**快照（与 snapshot() 同形）：否则调用方拿到的是少几个键的
         #   另一种形状，取 loggedIn 就会 KeyError / 拿到旧值。
-        return self.snapshot()
+        return self.snapshot(key)
 
     def _after_login(self, session: LoginSession) -> None:
         """登录流程跑完后补一次检查：进程正常退出 ≠ 扫上了。"""
         if (session.result or {}).get("ok"):
             rec = run_check(self.cfg, session.account)
             with self._lock:
-                self._check = rec
+                self._checks[session.account] = rec
 
     def session(self) -> Optional[LoginSession]:
-        with self._lock:
-            return self._session
+        """当前"显示的那个"会话（状态页用）。"""
+        return self._session(self._display_key())
 
-    def snapshot(self) -> Dict[str, Any]:
-        session = self.session()
-        rec = self.last_check()
+    def snapshot(self, account: str = "") -> Dict[str, Any]:
+        """会话快照。
+
+        `account` 传空 = 显示"当前那一个"（状态页按单会话渲染）；传了就是那个号。
+        """
+        key = self._resolve_key(account)
+        session = self._session(key)
+        rec = self.last_check(key)
         base: Dict[str, Any] = {
             "running": False,
-            "account": "",
+            "account": key,
             "headed": True,
             "startedAt": 0.0,
             "elapsedSec": 0.0,
@@ -327,18 +394,27 @@ class LoginSessionManager:
             base["loggedIn"] = None
         return base
 
-    def wait(self, seconds: float) -> Dict[str, Any]:
-        session = self.session()
+    def wait(self, seconds: float, account: str = "") -> Dict[str, Any]:
+        """等这个号（不传就是"显示的那个"）的会话一小段，然后回快照。"""
+        key = self._resolve_key(account)
+        session = self._session(key)
         if session is None:
-            return self.snapshot()
+            return self.snapshot(key)
         session.wait(seconds)
-        return self.snapshot()
+        return self.snapshot(key)
 
-    def cancel_login(self, quiet: bool = False) -> Dict[str, Any]:
-        session = self.session()
+    def cancel_login(self, account: str = "") -> Dict[str, Any]:
+        """关掉这个号（不传就是"显示的那个"）的待扫码会话。"""
+        key = self._resolve_key(account)
+        session = self._session(key)
         if session is not None:
             session.cancel()
-        return self.snapshot()
+        return self.snapshot(key)
+
+    def running_accounts(self) -> List[str]:
+        """当前还在等扫码的账号（排查用）。"""
+        with self._lock:
+            return sorted(k for k, s in self._sessions.items() if s.running)
 
 
 __all__ = ["CheckRecord", "LoginSession", "LoginSessionManager", "qr_path_for", "run_check"]

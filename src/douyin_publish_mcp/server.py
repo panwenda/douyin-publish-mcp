@@ -35,6 +35,7 @@ import base64
 import hashlib
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -42,6 +43,7 @@ from . import __version__
 from . import account as account_mod
 from . import creator_publish
 from . import douyin_browser as browser
+from .account_lock import AccountLocks
 from .creator_publish import PublishAbort
 from .creator_publish import NOTE_TEXT_MAX
 from .douyin_cred import default_account, resolve_credential
@@ -60,6 +62,15 @@ SERVER_NAME = "douyin-publish-mcp"
 # ★ 版本号只有一个来源（包的 `__version__`）：两处各写一份迟早分叉，
 #   而"装的是哪一版"在商店、状态页、tools/list 的 serverInfo 里都靠它。
 SERVER_VERSION = __version__
+
+#: 不吃账号锁的工具：**不开浏览器、不碰凭据**的纯线上探测。
+#:
+#: ★ 必须放行 `douyin_account_status`：它只打一次直连探针
+#:   （`account.check_account` 走 `/aweme/v1/web/user/profile/self/`，**不开浏览器**），
+#:   而"扫完再查一下"是登录流程的标准动作 —— 锁住会让它卡在正在跑的发布后面
+#:   最长几分钟，正好把最需要它的时候堵死。
+#:   发布 / 读取 / 登录 / 登出**都不在此列**（它们要么开浏览器、要么写凭据文件）。
+_LOCK_FREE_TOOLS = frozenset({"douyin_account_status"})
 
 # 二维码图片回传上限：超过就不塞进 tool 结果（会白烧上下文，还会拖慢一次调用）
 QRCODE_MAX_BYTES = 3 * 1024 * 1024
@@ -121,6 +132,14 @@ TOOLS: List[Dict[str, Any]] = [
                 "wait_seconds": {
                     "type": "number",
                     "description": "本次调用最多等多少秒（默认 90，上限 600）。超时不中断登录：会话仍在后台等扫码。",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": (
+                        "默认 false：同一个号已经在等扫码时**复用**那个会话 —— 重复调本工具就是"
+                        "「继续查那一个」，不会把用户手里的二维码弄失效。"
+                        "只在确实要换一张新码时才传 true（会把还在等的旧会话关掉）。"
+                    ),
                 },
             },
             "required": ["account"],
@@ -426,27 +445,38 @@ def tool_account_login(
     #   而且可能要求短信二次验证 —— 那只能在窗口里手动输，无头做不到。
     #   窗口不会久留：扫码成功后存完凭据就关掉浏览器并退出进程，没人扫也最多等几分钟。
     headed = bool(args.get("headed", True))
+    # ★ 默认**复用**同一个号正在等的会话（不重开）：重复调用只是"继续查"，
+    #   重开会把用户手里那张二维码弄失效。要新码才传 force=true。
+    force = bool(args.get("force", False))
     wait_seconds = _bounded_float(args.get("wait_seconds"), default=90.0, lo=0.0, hi=600.0)
     sessions = sessions or LoginSessionManager(cfg)
 
-    snap = sessions.start_login(account, headed=headed)
+    snap = sessions.start_login(account, headed=headed, force=force)
     if wait_seconds > 0 and snap.get("running"):
-        snap = sessions.wait(wait_seconds)
+        # ★ 带上账号：会话是按账号存的，不传就是"状态页显示的那一个"。
+        snap = sessions.wait(wait_seconds, account)
 
     content: List[Dict[str, Any]] = []
     lines: List[str] = []
     if snap.get("running"):
         lines.append(
             f"账号「{account}」的登录已发起，**正在等扫码**（已等 {snap.get('elapsedSec')}s）。\n"
-            "浏览器窗口已经弹在用户的屏幕上了，让用户直接在窗口里扫码。\n"
+            # ★ 这句必须跟着 headed 走：无头登录根本没有窗口，
+            #   说"窗口已经弹在屏幕上了"会让用户白等一个不存在的窗口（实测踩到）。
             + (
-                "（同一个二维码也附在下面这张图里；不方便看窗口时扫这张也行。）\n"
+                "浏览器窗口已经弹在用户的屏幕上了，让用户直接在窗口里扫码。\n"
+                if headed
+                else "本次是**无头登录**（没有窗口），请扫下面这张二维码图片。\n"
+            )
+            + (
+                "（同一个二维码也以图片附在下面，直接扫它也行。）\n"
                 if snap.get("qrPath")
                 else ""
             )
             + "**扫完窗口会自动关闭**，不用手动关。"
             f"扫完后**再调一次本工具**（或 douyin_account_status）确认结果 —— "
-            f"重复调用不会另开一个登录会话，只是继续查这一个。"
+            f"重复调用不会另开一个登录会话，只是继续查这一个"
+            f"（真换了扫码窗口、想要新码时才传 force=true）。"
         )
     elif snap.get("succeeded"):
         state = snap.get("loggedIn")
@@ -937,6 +967,10 @@ class Server:
         #   看到的是同一份状态（同一个 Server 实例），不会出现"页面说在等扫码、
         #   工具说没有会话"这种自相矛盾。
         self.sessions = LoginSessionManager(self.cfg)
+        # ★ 账号级互斥：**同账号串行、不同账号并行**（见 account_lock.py）。
+        #   放在 Server 上而不是模块级全局：HTTP 形态下状态页与工具共用这一个实例，
+        #   页面上点的"登录/登出"与工具调用走的是同一把锁。
+        self.locks = AccountLocks()
         self.tools: Dict[str, Callable[[RuntimeConfig, Dict[str, Any]], Dict[str, Any]]] = {
             "douyin_account_status": lambda c, a: tool_account_status(c, a, self.sessions),
             "douyin_account_login": lambda c, a: tool_account_login(c, a, self.sessions),
@@ -981,8 +1015,17 @@ class Server:
                 return _err(req_id, -32602, f"未知工具：{name}")
             if not isinstance(arguments, dict):
                 return _err(req_id, -32602, "arguments 必须是对象")
+            # ★ 同账号串行（不同账号各锁各的）。键 = 这次调用要用的账号，
+            #   归一化口径与凭据文件一致（见 config.account_key）——
+            #   否则 `" work "` 与 `"work"` 会读同一份 cookie 却拿两把不同的锁。
+            hold = (
+                nullcontext()
+                if name in _LOCK_FREE_TOOLS
+                else self.locks.hold(arguments.get("account"))
+            )
             try:
-                return _ok(req_id, fn(self.cfg, arguments))
+                with hold:
+                    return _ok(req_id, fn(self.cfg, arguments))
             except ConfigError as e:
                 # 参数/环境问题：当成工具错误回给模型（它要转述给用户去改配置）
                 return _ok(req_id, _text(str(e), True))

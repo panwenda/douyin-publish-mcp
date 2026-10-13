@@ -582,17 +582,44 @@ class TestAccountTools(ServerCase):
         self.assertIn("登录成功", self.text_of(result))
         self.assertIs(True, self.server.sessions.snapshot()["loggedIn"])
 
-    def test_登录_同刻只保留一个待扫码会话(self):
+    def test_登录_同账号重复调用复用会话(self):
+        """★ 重复调 `account_login` 只是"继续查那一个" —— 不能把用户手里的二维码弄失效。
+
+        （工具提示里写着"扫完再调一次确认结果"，若照做却把码弄失效，就是自相矛盾。）
+        """
         first = FakeProc(exit_after=None)
-        second = FakeProc(exit_after=None)
+        with self._spawn(first) as spawn:
+            self.call("douyin_account_login", {"account": "main", "wait_seconds": 0})
+            self.call("douyin_account_login", {"account": "main", "wait_seconds": 0})
+        self.assertEqual(1, spawn.call_count, "同一个号不该另起一个登录进程")
+        self.assertFalse(first.terminated, "复用会话时不能把它关掉")
+        self.assertTrue(self.server.sessions.snapshot("main")["running"])
+
+    def test_登录_force才重开会话(self):
+        first, second = FakeProc(exit_after=None), FakeProc(exit_after=None)
         with mock.patch.object(
             browser, "spawn_helper",
             side_effect=[helper_run(first, self.root), helper_run(second, self.root)],
-        ):
+        ) as spawn:
             self.call("douyin_account_login", {"account": "main", "wait_seconds": 0})
-            self.call("douyin_account_login", {"account": "main2", "wait_seconds": 0})
-        self.assertTrue(first.terminated, "开新会话必须把旧的关掉")
-        self.assertEqual(self.server.sessions.snapshot()["account"], "main2")
+            self.call("douyin_account_login",
+                      {"account": "main", "wait_seconds": 0, "force": True})
+        self.assertEqual(2, spawn.call_count, "force=true 才该另起一个")
+        self.assertTrue(first.terminated, "force=true 要关掉还在等的旧会话")
+        self.assertTrue(self.server.sessions.snapshot("main")["running"])
+
+    def test_登录_不同账号互不顶掉(self):
+        """★ 多账号：登录 work 不该把 personal 的待扫码会话顶掉（原来只有一份会话）。"""
+        work, personal = FakeProc(exit_after=None), FakeProc(exit_after=None)
+        with mock.patch.object(
+            browser, "spawn_helper",
+            side_effect=[helper_run(work, self.root), helper_run(personal, self.root)],
+        ):
+            self.call("douyin_account_login", {"account": "work", "wait_seconds": 0})
+            self.call("douyin_account_login", {"account": "personal", "wait_seconds": 0})
+        self.assertFalse(work.terminated, "登录另一个号不该关掉这个号的会话")
+        self.assertTrue(self.server.sessions.snapshot("work")["running"])
+        self.assertTrue(self.server.sessions.snapshot("personal")["running"])
 
     def test_重置登录态_两步(self):
         calls = []

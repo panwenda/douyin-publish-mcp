@@ -66,6 +66,24 @@ def default_account() -> str:
     return _env("DOUYIN_ACCOUNT") or "main"
 
 
+def account_key(account: str = "") -> str:
+    """账号的**归一化键**：空值 → 默认账号（`DOUYIN_ACCOUNT`，兜底 `main`）。
+
+    非安全字符统一压成 `_`（顺带挡掉路径穿越：`.`/`/`/`\\` 都不在允许集里）。
+
+    ★★ 为什么要有这个函数：**账号锁与凭据文件必须用同一个键**。
+      `" work "` 与 `"work"` 会解析到**同一份** `douyin_work.json`，
+      若一个用原始串、一个用清洗后的串，两者就是"同一份 cookie 被两把不同的锁保护" ——
+      串行看着生效，实际漏在同名账号上，最难查。
+      （小红书 MCP 那边踩过同一个坑，见 `account_lock.go` 的说明。）
+
+    ★ 非字符串（模型偶尔传数字/对象）按"没给"处理 —— 与 `server._opt_str` 同一口径。
+    """
+    raw = account if isinstance(account, str) else ""
+    name = (raw or default_account()).strip() or "main"
+    return re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", name) or "main"
+
+
 def credential_path(account: str = "") -> Path:
     """登录态（storage_state）的**默认**落点：我们自己的数据目录下的 `douyin_<账号>.json`。
 
@@ -73,9 +91,7 @@ def credential_path(account: str = "") -> Path:
       一台机器上多个账号就是多个文件，互不覆盖。
     ★ 要用别的文件（比如从浏览器导出的那份），设 `DOUYIN_COOKIE_FILE` —— 显式配置永远优先。
     """
-    name = (account or default_account()).strip() or "main"
-    safe = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", name) or "main"
-    return data_dir() / ("douyin_%s.json" % safe)
+    return data_dir() / ("douyin_%s.json" % account_key(account))
 
 
 @dataclass
@@ -182,6 +198,7 @@ __all__ = [
     "SERVER_NAME",
     "ConfigError",
     "RuntimeConfig",
+    "account_key",
     "credential_path",
     "data_dir",
     "default_account",
