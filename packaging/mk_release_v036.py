@@ -68,14 +68,23 @@ setattr(sys, name, io.TextIOWrapper(raw, encoding="utf-8", errors="replace", wri
 
 ## 验证
 
-- 本地**一字不差复现**了原报错：
+- 本地**一字不差复现**了原报错的那条路径：
   `open(99999,"wb") -> OSError: [WinError 6] 句柄无效。兜底流类型: BufferedWriter`
   → `★★ 复现成功 -> a bytes-like object is required, not 'str'`
+- ★ **诚实说明**：用三种「不给 std 句柄」的真实构造（Python `STARTUPINFO` 的
+  `STARTF_USESTDHANDLES`+NULL、ctypes 直接 `CreateProcess` 传 NULL handle、
+  `exec` 前先 `os.close(2)`）都**没能**让当前 exe 走进那条兜底分支 ——
+  PyInstaller 的 bootloader 启动时会把 fd 0/1/2 准备好。
+  所以这个 bug 的**触发条件是罕见的**（这也解释了为什么它一直没暴露）；
+  但缺陷本身是**代码层面确定**的：二进制流上 `write(str)` 必抛，
+  而全仓库给 `sys.stderr` 赋值的地方**只有这一处**。修掉是纯收益。
 - 新增 2 条回归测试（`tests/test_server.py::TestStdStreamRestore`）：
   ① 句柄无效时兜底流**也必须能写字符串**（必须真的 `write(str)` ——
      只断言"流不是 None"抓不住，二进制流也不是 None）；
   ② 恢复后必须是 `TextIOWrapper` 且 encoding=utf-8。
 - **全量 216 条测试全过**。
+- 发布件自检：onefile / onedir 均 `--http` 起来 `/health` 报 **0.3.6**；
+  **`WindowsTerminal.exe` 可见窗口增量为 0**（不弹窗）。
 
 ## 资产
 
