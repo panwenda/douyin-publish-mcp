@@ -562,6 +562,47 @@ class TestAccountTools(ServerCase):
             result = self.call("douyin_account_status", {"account": "main"})
         self.assertIn("logged_in=None", self.text_of(result))
 
+    def test_批量查多个账号(self):
+        """★ 一次查多个号（2026-10-16）：逐行报登录态与当前登录用户（昵称）。"""
+        def fake_check(cfg, account):
+            table = {
+                "main": AccountCheck(account="main", logged_in=True, ok=True,
+                                     output="已登录", nickname="张三"),
+                "work": AccountCheck(account="work", logged_in=False, ok=True, output="未登录"),
+            }
+            return table[account]
+
+        with mock.patch.object(login_session, "check_account", side_effect=fake_check):
+            result = self.call("douyin_account_status", {"accounts": ["main", "work"]})
+
+        text = self.text_of(result)
+        self.assertFalse(result["isError"])
+        self.assertIn("共查 2 个账号：已登录 1，未登录 1", text)
+        self.assertIn("昵称：张三", text)
+        self.assertIn('douyin_account_login(account="work")', text)
+
+    def test_批量查all展开本机已配置账号(self):
+        """accounts=["all"] 按凭据文件枚举（ServerCase 数据目录里已有 douyin_main.json）。"""
+        seen = []
+
+        def fake_check(cfg, account):
+            seen.append(account)
+            return AccountCheck(account=account, logged_in=True, ok=True,
+                                output="已登录", nickname="N")
+
+        with mock.patch.object(login_session, "check_account", side_effect=fake_check):
+            result = self.call("douyin_account_status", {"accounts": ["all"]})
+
+        self.assertIn("main", seen, "all 应展开出数据目录里已配置的账号")
+        self.assertIn("已登录 1", self.text_of(result))
+
+    def test_单账号不传account用默认账号(self):
+        """account 从必填改成可选的兼容面：不传 = 默认账号（DOUYIN_ACCOUNT，兜底 main）。"""
+        with self._check(True):
+            result = self.call("douyin_account_status", {})
+        self.assertFalse(result["isError"], "不传 account 不该报错（旧版是必填，新契约是可选）")
+        self.assertIn("账号「%s」" % config_mod.account_key(""), self.text_of(result))
+
     def test_登录_等不到扫码时回报会话仍在等(self):
         with self._spawn(FakeProc(exit_after=None)):
             result = self.call(

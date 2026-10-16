@@ -55,7 +55,7 @@ from .douyin_web import (
     extract_share_url,
 )
 from .login_session import LoginSessionManager
-from .config import ConfigError, RuntimeConfig, credential_path
+from .config import ConfigError, RuntimeConfig, account_key, credential_path
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "douyin-publish-mcp"
@@ -95,16 +95,23 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "douyin_account_status",
         "description": (
-            "查询某个抖音账号的登录态（本地凭据文件是否还有效）。"
+            "查询抖音账号的登录态（本地凭据文件是否还有效）。"
             "发布/登录前先查一次，避免发到一半才发现没登录。"
             "account 是登录时用的账号名（不是抖音昵称）。"
+            "★ 一次查多个账号：用 accounts 数组（元素 \"all\"/\"*\" 表示**本机全部已配置账号**），"
+            "返回每个号的登录态与当前登录用户（昵称）；传了 accounts 就忽略 account。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "account": {"type": "string", "description": "账号名（登录时自定义的名字）"},
+                "account": {"type": "string", "description": "账号名（登录时自定义的名字）。不传则用默认账号（DOUYIN_ACCOUNT，兜底 main）。"},
+                "accounts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "账号名列表：一次批量查询多个账号的登录态（含当前登录用户昵称）；元素 \"all\"/\"*\" 展开为本机全部已配置账号。",
+                },
             },
-            "required": ["account"],
+            "required": [],
             "additionalProperties": False,
         },
     },
@@ -384,17 +391,104 @@ def _image_item(path: Path) -> Optional[Dict[str, Any]]:
     return {"type": "image", "data": base64.b64encode(data).decode("ascii"), "mimeType": mime}
 
 
+#: 批量查登录态的账号数上限：每个账号是一次网络探针，别让模型丢一长串进来。
+_MAX_BATCH_STATUS = 20
+
+
+def _expand_accounts(accounts: List[Any]) -> List[str]:
+    """展开批量查登录态的账号入参：
+
+    - "all" / "*"（大小写不敏感）→ 本机全部已配置账号（account.list_accounts，按凭据文件枚举）；
+    - 其余按 account_key 归一化（" work " ≡ "work"，空串 → 默认账号）；
+    - 去重、保持首次出现顺序、截断到 _MAX_BATCH_STATUS。
+    """
+    out: List[str] = []
+    seen = set()
+
+    def add(raw: str) -> None:
+        if len(out) >= _MAX_BATCH_STATUS:
+            return
+        key = account_key(raw)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+
+    for raw in accounts:
+        text = raw.strip() if isinstance(raw, str) else ""
+        if text.lower() in ("all", "*", "全部"):
+            for name in account_mod.list_accounts():
+                add(name)
+        else:
+            add(text)
+    return out
+
+
+def _batch_account_status(sessions: "LoginSessionManager", accounts_raw: List[Any]) -> Dict[str, Any]:
+    """一次查多个账号：逐个走直连探针（不开浏览器、不吃锁），汇总成一张清单。
+
+    ★ 与单账号路径同一口径：被风控挡住 = "判不出来"，**不猜**"没登录"。
+    """
+    names = _expand_accounts(accounts_raw)
+    if not names:
+        return _text(
+            "没有可检查的账号：本机数据目录里没有 douyin_*.json 凭据文件。\n"
+            "下一步：用 douyin_account_login(account=\"...\") 扫码登录，"
+            "或在 accounts 里显式列出账号名。",
+            is_error=False,
+        )
+
+    recs = [(name, sessions.check(name)) for name in names]
+
+    ok_n = sum(1 for _, r in recs if not r.skipped and r.logged_in is True)
+    no_n = sum(1 for _, r in recs if not r.skipped and r.logged_in is False)
+    skip_n = sum(1 for _, r in recs if r.skipped)
+    unknown_n = sum(1 for _, r in recs if not r.skipped and r.logged_in is None)
+
+    head = "共查 %d 个账号：已登录 %d，未登录 %d" % (len(recs), ok_n, no_n)
+    if unknown_n:
+        head += "，判不出来 %d" % unknown_n
+    if skip_n:
+        head += "，跳过 %d" % skip_n
+    lines = [head + "。", ""]
+
+    for name, rec in recs:
+        if rec.skipped:
+            lines.append("- %s：正在等扫码，本次跳过（扫完会自动检查）。" % name)
+        elif rec.logged_in is True:
+            lines.append(
+                "- %s：已登录%s。"
+                % (name, ("（昵称：%s）" % rec.nickname) if rec.nickname else "（未读到昵称）")
+            )
+        elif rec.logged_in is False:
+            lines.append(
+                "- %s：未登录 —— 下一步：douyin_account_login(account=\"%s\")。" % (name, name)
+            )
+        else:
+            lines.append(
+                "- %s：判不出来（探针没成功，可能被风控短暂挡住；**不代表未登录**）。" % name
+            )
+    lines.append("")
+    lines.append("判据：直连探针 /aweme/v1/web/user/profile/self/ —— 能拿到自己的资料 = 已登录。")
+    return _text("\n".join(lines), is_error=False)
+
+
 def tool_account_status(
     cfg: RuntimeConfig, args: Dict[str, Any], sessions: Optional["LoginSessionManager"] = None
 ) -> Dict[str, Any]:
-    """查登录态。
+    """查登录态（单账号，或 accounts 一次性查多个）。
 
     ★ 判据是**直连探针**（打抖音的用户资料接口）：
       能拿到自己的资料 = 已登录；被风控挡住 = 如实说「判不出来」，
       绝不猜成「没登录」—— 那会让用户白扫一次码。
     """
-    account = _require_str(args, "account")
     sessions = sessions or LoginSessionManager(cfg)
+
+    # ★ 批量模式：accounts 非空列表就一次查多个（"all" 展开为本机已配置账号）。
+    batch = args.get("accounts")
+    if isinstance(batch, list) and batch:
+        return _batch_account_status(sessions, batch)
+
+    account = account_key(_opt_str(args, "account"))
     rec = sessions.check(account)
     if rec.skipped:
         # 「没查」不等于「没登录」：如实说跳过，并告诉模型下一步

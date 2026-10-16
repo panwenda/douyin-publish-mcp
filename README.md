@@ -126,7 +126,7 @@ v0.3.0 起登录 / 账号检查 / 发布**全部自带**（就放在本包里，
 
 | 工具 | 作用 | 模型该怎么用 |
 | --- | --- | --- |
-| `douyin_account_status(account)` | 查登录态 | 判据是**直连探针** `/aweme/v1/web/user/profile/self/`（能拿到自己的资料就是有效）；被风控挡住时如实说「判不出来」，**不猜**"没登录" |
+| `douyin_account_status(account?, accounts?)` | 查登录态（单个或**一次多个**） | 判据是**直连探针** `/aweme/v1/web/user/profile/self/`（能拿到自己的资料就是有效）；被风控挡住时如实说「判不出来」，**不猜**"没登录"。传 `accounts` 数组可一次查多个号（含当前登录用户昵称），元素 `"all"/"*"` 展开为本机全部已配置账号 |
 | `douyin_account_login(account, headed=true, wait_seconds=90, force=false)` | 扫码登录（**会话式**） | 弹**真窗口**（抖音会挑无头浏览器，且可能要输短信验证码），二维码同时以图片返回；**扫完窗口自动关闭**（没人扫也最多 2 分钟）；调用等一段就返回状态，还在等就**再调一次**继续查（**复用同一个会话，不会另开**；要换新码传 `force=true`）；扫完自动检查一次 |
 | `douyin_account_logout(account, confirm=false)` | 重置登录态 | ★ 两步：先回报"将要删除的凭据文件"，用户同意后才 `confirm=true` |
 | `douyin_publish_video(account, file, title, description?, tags?, schedule?, thumbnail_portrait?, thumbnail_landscape?, product_link?, product_title?, declaration?, collection?, plan_id?, confirm?)` | 发布视频 | 先不传 confirm 拿计划 → 念给用户 → 带 `plan_id`+`confirm=true` 再调 |

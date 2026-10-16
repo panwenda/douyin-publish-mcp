@@ -20,7 +20,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .config import ConfigError, RuntimeConfig
 from .douyin_cred import Credential, resolve_credential
@@ -39,6 +39,8 @@ class AccountCheck:
     #: 会话正在等扫码时会**跳过**检查：这不是失败，调用方要区别对待
     skipped: bool = False
     source: str = ""
+    #: 已登录时的昵称（探针顺带拿到的"当前登录用户"；读不到就是空串）
+    nickname: str = ""
 
 
 def credential_detail(cred: Credential) -> str:
@@ -105,12 +107,60 @@ def check_account(cfg: RuntimeConfig, account: str = "") -> AccountCheck:
         logged_in=True,
         ok=True,
         source=cred.source,
+        nickname=nickname,
         output=(
             "**已登录**（账号「%s」%s），可以发布。\n%s\n\n"
             "判据：直连拿到「我的资料」（/aweme/v1/web/user/profile/self/）。"
             % (cred.account, ("，昵称：%s" % nickname) if nickname else "", credential_detail(cred))
         ),
     )
+
+
+def list_accounts() -> List[str]:
+    """列出本机**已配置凭据**的账号名：默认账号在前，其余按字典序。
+
+    ★ 用途：批量查询登录态（`accounts=["all"]`）—— 调用方通常记不住
+      "到底登过哪几个号"，让服务按凭据文件自己枚举。
+
+    判据与 `resolve_credential` 的凭据来源一一对应，**只数存在的凭据**：
+      - 默认账号：`DOUYIN_COOKIE` 非空、或 `DOUYIN_COOKIE_FILE` 指向的文件存在、
+        或 <数据目录>/douyin_<默认账号>.json 存在；
+      - 其余账号：<数据目录>/douyin_<账号>.json 存在。
+    """
+    from .config import account_key, credential_path, data_dir, default_account as _default_account
+
+    names: List[str] = []
+    seen = set()
+
+    def add(raw: str) -> None:
+        key = account_key(raw)
+        if key and key not in seen:
+            seen.add(key)
+            names.append(key)
+
+    has_default = bool((os.environ.get("DOUYIN_COOKIE") or "").strip())
+    explicit = (os.environ.get("DOUYIN_COOKIE_FILE") or "").strip()
+    if explicit:
+        try:
+            has_default = has_default or Path(explicit).expanduser().is_file()
+        except OSError:
+            pass
+    try:
+        has_default = has_default or credential_path(_default_account()).is_file()
+    except OSError:
+        pass
+    if has_default:
+        add(_default_account())
+
+    try:
+        files = sorted(data_dir().glob("douyin_*.json"))
+    except OSError:
+        files = []
+    for path in files:
+        acct = path.name[len("douyin_"):-len(".json")]
+        if acct:
+            add(acct)
+    return names
 
 
 @dataclass
@@ -158,4 +208,4 @@ def _default_credential_path(account: str) -> Path:
     return credential_path(account)
 
 
-__all__ = ["AccountCheck", "LogoutPlan", "check_account", "credential_detail", "logout"]
+__all__ = ["AccountCheck", "LogoutPlan", "check_account", "credential_detail", "list_accounts", "logout"]
